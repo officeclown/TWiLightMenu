@@ -681,10 +681,32 @@ void vBlankHandler()
 		}
 
 		for (int i = 0; i < 7; i++) {
-			if (moveIconUp[i]) {
-				iconYpos[i] -= 6;
-				updateFrame = true;
+			if (!moveIconUp[i]) continue;
+
+			iconYpos[i] -= 6;
+			if (iconYpos[i] < -64) {
+				moveIconUp[i] = false;
+				continue;
 			}
+			if (moveIconUp[0] || moveIconUp[3]) {
+				static u16* src = NULL;
+				static u16* dst = NULL;
+
+				if (src) {
+					dmaCopyWordsAsynch(0, src, dst, 45 * 256); // Move text in sync with the icon box
+				}
+
+				// Store text movement for next frame
+				u16* bgPtr = bgGetGfxPtr(2);
+				int textMoveSrc = iconYpos[i]+6;
+				if (textMoveSrc < 0) textMoveSrc = 6;
+				int textMoveDst = iconYpos[i];
+				if (textMoveDst < 0) textMoveDst = 0;
+
+				src = bgPtr + (textMoveSrc * (256/2));
+				dst = bgPtr + (textMoveDst * (256/2));
+			}
+			updateFrame = true;
 		}
 	}
 
@@ -743,7 +765,7 @@ void vBlankHandler()
 				if ((isDSiMode() && !flashcardFound() && sys().arm7SCFGLocked()) || (io_dldi_data->ioInterface.features & FEATURE_SLOT_GBA)) {
 					glSprite(40, iconYpos[0]+6, GL_FLIP_NONE, &icon_dscard.images[0]);
 				} else drawIcon(1, 40, iconYpos[0]+6);
-				if (bnrWirelessIcon[1] > 0) glSprite(207, iconYpos[0]+30, GL_FLIP_NONE, &wirelessicons.images[(bnrWirelessIcon[0]-1) & 31]);
+				if (bnrWirelessIcon[1] > 0) glSprite(207, iconYpos[0]+30, GL_FLIP_NONE, &wirelessicons.images[bnrWirelessIcon[1]-1]);
 			}
 			glSprite(33, iconYpos[1], GL_FLIP_NONE, getMenuEntryTexture(MenuEntry::PICTOCHAT));
 			glSprite(129, iconYpos[2], GL_FLIP_NONE, getMenuEntryTexture(MenuEntry::DOWNLOADPLAY));
@@ -756,7 +778,7 @@ void vBlankHandler()
 			if (sys().isRegularDS() || (dsiFeatures() && !sys().i2cBricked() && ms().consoleModel < 2)) {
 				glSprite(10, iconYpos[4], GL_FLIP_NONE, getMenuEntryTexture(MenuEntry::BRIGHTNESS));
 			}
-			if (bnrWirelessIcon[num] > 0) glSprite(207, iconYpos[3]+30, GL_FLIP_NONE, &wirelessicons.images[(bnrWirelessIcon[1]-1) & 31]);
+			if (bnrWirelessIcon[num] > 0) glSprite(207, iconYpos[3]+30, GL_FLIP_NONE, &wirelessicons.images[bnrWirelessIcon[num]-1]);
 			if (!ms().kioskMode) {
 				glSprite(117, iconYpos[5], GL_FLIP_NONE, getMenuEntryTexture(MenuEntry::SETTINGS));
 			}
@@ -844,15 +866,21 @@ static void clockNeedleDraw(int angle, u32 length, u16 color) {
 }
 
 static void markerLoad(void) {
-	char filePath[256];
-	snprintf(filePath, sizeof(filePath), "nitro:/graphics/calendar/marker/%i.png", getFavoriteColor());
+	char filePath[40];
+	sprintf(filePath, "nitro:/graphics/calendar/marker.png");
 	FILE* file = fopen(filePath, "rb");
 
 	if (file) {
+		u8 pngImage[0x9C];
+		fread(pngImage, 1, 0x9C, file);
+		fseek(file, getFavoriteColor()*0xE, SEEK_CUR);
+		fread(pngImage+0x46, 1, 0xE, file);
+		fclose(file);
+
 		// Start loading
 		std::vector<unsigned char> image;
 		unsigned width, height;
-		lodepng::decode(image, width, height, filePath);
+		lodepng::decode(image, width, height, pngImage, 0x9C);
 		for (unsigned i=0;i<image.size()/4;i++) {
 			markerImageBuffer[i] = image[i*4]>>3 | (image[(i*4)+1]>>3)<<5 | (image[(i*4)+2]>>3)<<10 | BIT(15);
 			if (colorTable) {
@@ -860,8 +888,6 @@ static void markerLoad(void) {
 			}
 		}
 	}
-
-	fclose(file);
 }
 
 static void markerDraw(int x, int y) {
@@ -1233,15 +1259,21 @@ void topBgLoad(void) {
 void topBarLoad(void) {
 	if (ms().macroMode) return;
 
-	char filePath[256];
-	snprintf(filePath, sizeof(filePath), "nitro:/graphics/%s/%i.png", "topbar", getFavoriteColor());
+	char filePath[32];
+	sprintf(filePath, "nitro:/graphics/topbar.png");
 	FILE* file = fopen(filePath, "rb");
 
 	if (file) {
+		u8 pngImage[0x100];
+		fread(pngImage, 1, 0x100, file);
+		fseek(file, getFavoriteColor()*0x10, SEEK_CUR);
+		fread(pngImage+0x78, 1, 0x10, file);
+		fclose(file);
+
 		// Start loading
 		std::vector<unsigned char> image;
 		unsigned width, height;
-		lodepng::decode(image, width, height, filePath);
+		lodepng::decode(image, width, height, pngImage, 0x100);
 		for (unsigned i=0;i<image.size()/4;i++) {
 			bmpImageBuffer[i] = image[i*4]>>3 | (image[(i*4)+1]>>3)<<5 | (image[(i*4)+2]>>3)<<10 | BIT(15);
 			if (colorTable) {
@@ -1260,8 +1292,6 @@ void topBarLoad(void) {
 			x++;
 		}
 	}
-
-	fclose(file);
 
 	char16_t username[11] = {0};
 	memcpy(username, useTwlCfg ? (s16 *)0x02000448 : PersonalData->name, 10 * sizeof(char16_t));

@@ -84,6 +84,7 @@ dsiMode:
 #define LOADFROMRAM_OFFSET 44
 #define LANGUAGE_OFFSET 48
 #define TSC_TGDS_OFFSET 52
+#define COMMON_CACHE_OFFSET 56
 
 
 typedef signed int addr_t;
@@ -181,8 +182,25 @@ static bool dldiPatchLoader (void)
 	return true;
 }
 
-int runNds (const void* loader, u32 loaderSize, u32 cluster, bool initDisc, bool dldiPatchNds, bool loadFromRam, const char* filename, int argc, const char** argv, bool clearMasterBright, bool dsModeSwitch, bool lockScfg, bool boostCpu, bool boostVram, bool tscTgds, int language)
-{
+int runNds (
+	const void* loader,
+	u32 loaderSize,
+	u32 cluster,
+	bool initDisc,
+	bool dldiPatchNds,
+	bool loadFromRam,
+	const char* filename,
+	int argc,
+	const char** argv,
+	bool clearMasterBright,
+	bool dsModeSwitch,
+	bool lockScfg,
+	bool boostCpu,
+	bool boostVram,
+	bool tscTgds,
+	int language,
+	u32 commonCache
+) {
 	char* argStart;
 	u16* argData;
 	u16 argTempVal = 0;
@@ -215,6 +233,7 @@ int runNds (const void* loader, u32 loaderSize, u32 cluster, bool initDisc, bool
 	writeAddr ((data_t*) LCDC_BANK_C, LOADFROMRAM_OFFSET, loadFromRam);
 	writeAddr ((data_t*) LCDC_BANK_C, LANGUAGE_OFFSET, language);
 	writeAddr ((data_t*) LCDC_BANK_C, TSC_TGDS_OFFSET, tscTgds);
+	writeAddr ((data_t*) LCDC_BANK_C, COMMON_CACHE_OFFSET, commonCache);
 
 	// WANT_TO_PATCH_DLDI = dldiPatchNds;
 	writeAddr ((data_t*) LCDC_BANK_C, WANT_TO_PATCH_DLDI_OFFSET, dldiPatchNds);
@@ -305,7 +324,7 @@ bool runNds9 (const char* filename, bool dsModeSwitch) {
 	return true;
 }
 
-int runUnlaunchDsi (const char* filename, u32 sector) {
+int runUnlaunchDsi (const char* filename, bool isRunFromSD, u32 sector) {
 	FILE* ndsFile = fopen(filename, "rb");
 	fseek(ndsFile, 0, SEEK_SET);
 	fread(__DSiHeader, 1, 0x1000, ndsFile);
@@ -315,96 +334,114 @@ int runUnlaunchDsi (const char* filename, u32 sector) {
 	fread((void*)0x02B80000, 1, __DSiHeader->ndshdr.arm7binarySize, ndsFile);
 	fclose(ndsFile);
 
-	extern int *removeLauncherPatchesPtr;
-	if (!removeLauncherPatchesPtr)
-		return 10;
+	extern bool *unlaunchSettingsPtr;
+	if (*unlaunchSettingsPtr) {
+		extern int *removeLauncherPatchesPtr;
+		if (!removeLauncherPatchesPtr)
+			return 10;
 
-	char ver19String[3];
-	tonccpy(ver19String, (char*)0x0280A591, 3);
-	char ver20String[3];
-	tonccpy(ver20String, (char*)0x0280A616, 3);
+		char ver19String[3];
+		tonccpy(ver19String, (char*)0x0280A591, 3);
+		char ver20String[3];
+		tonccpy(ver20String, (char*)0x0280A616, 3);
 
-	// Patch out splash and sound disable patches
-	if (*removeLauncherPatchesPtr == 0) { // 'Off', change launcher TID to block all patches
-		const char newID[3] = {'S','A','N'};
+		// Patch out splash and sound disable patches
+		if (*removeLauncherPatchesPtr == 0) { // 'Off', change launcher TID to block all patches
+			const char newID[3] = {'S','A','N'};
 
-		if (memcmp(ver19String, "1.9", 3) == 0) {
-			tonccpy((char*)0x02806E74, newID, 3);
-		} else if (memcmp(ver20String, "2.0", 3) == 0) {
-			tonccpy((char*)0x02806E91, newID, 3);
-		} else {
-			return 11;
+			if (memcmp(ver19String, "1.9", 3) == 0) {
+				tonccpy((char*)0x02806E74, newID, 3);
+			} else if (memcmp(ver20String, "2.0", 3) == 0) {
+				tonccpy((char*)0x02806E91, newID, 3);
+			} else {
+				return 11;
+			}
+		} else if(*removeLauncherPatchesPtr == 2) { // 'Default', just remove the sound/splash patches
+			void *patchSection = (void *)0x02804580;
+			const long patchSectionSize = 0x67FD;
+			const u32 sanityCheck = 0x00931C10; // First word of the section we're about to patch
+
+			if (memcmp(ver20String, "2.0", 3) != 0)
+				return 11;
+
+			char patchPath[56];
+			sprintf(patchPath, "%s:/_nds/TWiLightMenu/unlaunch/patch.bin", isRunFromSD ? "sd" : "fat");
+			FILE *patch = fopen(patchPath, "rb");
+			if (!patch)
+				return 12;
+
+			fseek(patch, 0, SEEK_END);
+			long size = ftell(patch);
+			fseek(patch, 0, SEEK_SET);
+
+			if (size > patchSectionSize) // Ensure the patch isn't too big
+				return 13;
+			else if(*(u32 *)patchSection != sanityCheck) // Something's up, this should match
+				return 14;
+
+			toncset(patchSection, 0, patchSectionSize);
+			if (fread(patchSection, 1, size, patch) != size)
+				return 15;
+
+			fclose(patch);
 		}
-	} else if(*removeLauncherPatchesPtr == 2) { // 'Default', just remove the sound/splash patches
-		void *patchSection = (void *)0x02804580;
-		const long patchSectionSize = 0x67FD;
-		const u32 sanityCheck = 0x00931C10; // First word of the section we're about to patch
 
-		if (memcmp(ver20String, "2.0", 3) != 0)
-			return 11;
+		extern const char *charUnlaunchBg;
+		char bgPath[256];
+		sprintf(bgPath, "%s:/_nds/TWiLightMenu/unlaunch/backgrounds/%s", isRunFromSD ? "sd" : "fat", charUnlaunchBg);
 
-		FILE *patch = fopen("nitro:/unlaunch-patch.bin", "rb");
-		if (!patch)
-			return 12;
+		FILE* gifFile = fopen(bgPath, "rb");
+		long fsize = 0;
+		if (gifFile) {
+			fseek(gifFile, 0, SEEK_END);
+			fsize = ftell(gifFile); // Get file size
+		}
 
-		fseek(patch, 0, SEEK_END);
-		long size = ftell(patch);
-		fseek(patch, 0, SEEK_SET);
+		if (fsize > 0 && fsize <= 0x3C70) {
+			// Check GIF
+			u16 gifWidth;
+			u16 gifHeight;
+			fseek(gifFile, 6, SEEK_SET);
+			fread(&gifWidth, 1, sizeof(u16), gifFile);
+			fread(&gifHeight, 1, sizeof(u16), gifFile);
 
-		if (size > patchSectionSize) // Ensure the patch isn't too big
-			return 13;
-		else if(*(u32 *)patchSection != sanityCheck) // Something's up, this should match
-			return 14;
+			if (gifWidth == 256 && gifHeight == 192) {
+				// Replace Unlaunch background with custom one
 
-		toncset(patchSection, 0, patchSectionSize);
-		if (fread(patchSection, 1, size, patch) != size)
-			return 15;
+				const u32 gifSignatureStart = 0x38464947;
+				const u32 gifSignatureEnd = 0x3B000044;
 
-		fclose(patch);
-	}
-
-	extern const char *charUnlaunchBg;
-	char bgPath[256];
-	sprintf(bgPath, "sd:/_nds/TWiLightMenu/unlaunch/backgrounds/%s", charUnlaunchBg);
-
-	FILE* gifFile = fopen(bgPath, "rb");
-	long fsize = 0;
-	if (gifFile) {
-		fseek(gifFile, 0, SEEK_END);
-		fsize = ftell(gifFile); // Get file size
-	}
-
-	if (fsize > 0 && fsize <= 0x3C70) {
-		// Check GIF
-		u16 gifWidth;
-		u16 gifHeight;
-		fseek(gifFile, 6, SEEK_SET);
-		fread(&gifWidth, 1, sizeof(u16), gifFile);
-		fread(&gifHeight, 1, sizeof(u16), gifFile);
-
-		if (gifWidth == 256 && gifHeight == 192) {
-			// Replace Unlaunch background with custom one
-
-			const u32 gifSignatureStart = 0x38464947;
-			const u32 gifSignatureEnd = 0x3B000044;
-
-			u32 iEnd = 0;
-			for (u32 i = 0x02800000; i < 0x02810000; i += 4) {
-				iEnd = i+0x3C6C;
-				if (*(u32*)i == gifSignatureStart && *(u32*)iEnd == gifSignatureEnd) {
-					fseek(gifFile, 0, SEEK_SET);
-					fread((void*)i, 1, 0x3C70, gifFile);
-					break;
+				u32 iEnd = 0;
+				for (u32 i = 0x02800000; i < 0x02810000; i += 4) {
+					iEnd = i+0x3C6C;
+					if (*(u32*)i == gifSignatureStart && *(u32*)iEnd == gifSignatureEnd) {
+						fseek(gifFile, 0, SEEK_SET);
+						fread((void*)i, 1, 0x3C70, gifFile);
+						break;
+					}
 				}
 			}
+			fclose(gifFile);
 		}
-		fclose(gifFile);
 	}
 
-	return runNds (load_bin, load_bin_size, sector, true, false, true, filename, 0, NULL, true, false, false, true, true, false, -1);
+	return runNds (load_bin, load_bin_size, sector, true, false, true, filename, 0, NULL, true, false, false, true, true, false, -1, 0);
 }
 
-int runNdsFile (const char* filename, int argc, const char** argv, bool isRunFromSD, bool dldiPatchNds, bool clearMasterBright, bool dsModeSwitch, bool boostCpu, bool boostVram, bool tscTgds, int language) {
+int runNdsFile (
+	const char* filename,
+	int argc,
+	const char** argv,
+	bool isRunFromSD,
+	bool dldiPatchNds,
+	bool clearMasterBright,
+	bool dsModeSwitch,
+	bool boostCpu,
+	bool boostVram,
+	bool tscTgds,
+	int language,
+	u32 commonCache
+) {
 	struct stat st;
 	char filePath[PATH_MAX];
 	int pathLen;
@@ -440,7 +477,7 @@ int runNdsFile (const char* filename, int argc, const char** argv, bool isRunFro
 		fclose(ndsFile);
 
 		if (memcmp(gameTitle, "UNLAUNCH.DSI", 0xC) == 0) {
-			return runUnlaunchDsi (filename, st.st_ino);
+			return runUnlaunchDsi (filename, isRunFromSD, st.st_ino);
 		}
 	}
 
@@ -453,7 +490,7 @@ int runNdsFile (const char* filename, int argc, const char** argv, bool isRunFro
 	installBootStub(havedsiSD, isRunFromSD, dsModeSwitch);
 	#endif
 
-	return runNds (load_bin, load_bin_size, st.st_ino, true, (dldiPatchNds && memcmp(io_dldi_data->friendlyName, "Default", 7) != 0), loadFromRam, filename, argc, argv, clearMasterBright, dsModeSwitch, lockScfg, boostCpu, boostVram, tscTgds, language);
+	return runNds (load_bin, load_bin_size, st.st_ino, true, (dldiPatchNds && memcmp(io_dldi_data->friendlyName, "Default", 7) != 0), loadFromRam, filename, argc, argv, clearMasterBright, dsModeSwitch, lockScfg, boostCpu, boostVram, tscTgds, language, commonCache);
 }
 
 /*

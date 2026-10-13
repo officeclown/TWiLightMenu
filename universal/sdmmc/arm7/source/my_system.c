@@ -31,15 +31,12 @@
 #include <nds/bios.h>
 #include <nds/arm7/clock.h>
 #include <nds/arm7/i2c.h>
+// #include <string.h>
 
 void powerValueHandler(u32 value, void* user_data);
 void firmwareMsgHandler(int bytes, void *user_data);
-#ifdef SDMMC_USE_FIFO
-void my_sdmmcMsgHandler(int bytes, void *user_data);
-void my_sdmmcValueHandler(u32 value, void* user_data);
-#else
 void my_sdmmcHandler();
-#endif
+void my_sdmmcHandlerFifo(u32 value, void* user_data);
 
 //---------------------------------------------------------------------------------
 void my_installSystemFIFO(void) {
@@ -49,14 +46,12 @@ void my_installSystemFIFO(void) {
 	fifoSetDatamsgHandler(FIFO_FIRMWARE, firmwareMsgHandler, 0);
 	
 	//if (isDSiMode() || (REG_SCFG_EXT & BIT(18))) {
-	#ifdef SDMMC_USE_FIFO
-	fifoSetValue32Handler(FIFO_SDMMC, my_sdmmcValueHandler, 0);
-	fifoSetDatamsgHandler(FIFO_SDMMC, my_sdmmcMsgHandler, 0);
-	#else
-	irqSet(IRQ_IPC_SYNC, my_sdmmcHandler);
-	irqEnable(IRQ_IPC_SYNC);
-	#endif
-	//}
+	// if (strncmp((const char*)0x04FFFA00, "no$gba", 6) == 0) {
+		irqSet(IRQ_IPC_SYNC, my_sdmmcHandler);
+		irqEnable(IRQ_IPC_SYNC);
+	/* } else {
+		fifoSetValue32Handler(FIFO_SDMMC, my_sdmmcHandlerFifo, 0);
+	} */
 }
 
 

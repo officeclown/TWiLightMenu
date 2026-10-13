@@ -59,14 +59,14 @@ bool CheatCodelist::parse(const std::string& aFileName)
   {
     const char* usrcheatPath = sys().isRunFromSD() ? "sd:/_nds/TWiLightMenu/extras/usrcheat.dat" : "fat:/_nds/TWiLightMenu/extras/usrcheat.dat";
     loadPerGameSettings(aFileName.substr(aFileName.find_last_of('/') + 1));
-	if (ms().secondaryDevice && !(perGameSettings_fcGameLoader == -1 ? (ms().fcGameLoader == TWLSettings::ENdsBootstrap) : (perGameSettings_fcGameLoader == TWLSettings::ENdsBootstrap)) && ms().kernelUseable && unitCode[ms().secondaryDevice] < 3) {
+	/* if (ms().secondaryDevice && !(perGameSettings_fcGameLoader == -1 ? (ms().fcGameLoader == TWLSettings::ENdsBootstrap) : (perGameSettings_fcGameLoader == TWLSettings::ENdsBootstrap)) && ms().kernelUseable && unitCode[ms().secondaryDevice] < 3) {
 		if ((memcmp(io_dldi_data->friendlyName, "R4iDSN", 6) == 0)
 	   || (memcmp(io_dldi_data->friendlyName, "R4iTT", 5) == 0)
      || (memcmp(io_dldi_data->friendlyName, "Acekard AK2", 0xB) == 0)
      || (memcmp(io_dldi_data->friendlyName, "Ace3DS+", 7) == 0)) {
 			usrcheatPath = "fat:/_wfwd/cheats/usrcheat.dat";
 		}
-	}
+	} */
     FILE* dat=fopen(usrcheatPath,"rb");
     if (dat)
     {
@@ -142,17 +142,17 @@ bool CheatCodelist::parseInternal(FILE* aDat,u32 gamecode,u32 crc32)
     u32 flagItem=0;
     if ((*ccode>>28)&1)
     {
-      flagItem|=cParsedItem::EInFolder;
-      if ((*ccode>>24)==0x11) flagItem|=cParsedItem::EOne;
+      flagItem|=cCheatDatItem::EInFolder;
+      if ((*ccode>>24)==0x11) flagItem|=cCheatDatItem::EOne;
       folderCount=*ccode&0x00ffffff;
       folderName=(char*)((u32)ccode+4);
       folderNote=(char*)((u32)folderName+strlen(folderName)+1);
-      _data.push_back(cParsedItem(folderName,folderNote,cParsedItem::EFolder));
+      _data.push_back(cCheatDatItem(folderName,folderNote,cCheatDatItem::EFolder));
       cc++;
       ccode=(u32*)(((u32)folderName+strlen(folderName)+1+strlen(folderNote)+1+3)&~3);
     }
 
-    u32 selectValue=cParsedItem::ESelected;
+    u32 selectValue=cCheatDatItem::ESelected;
     for (size_t ii=0;ii<folderCount;++ii)
     {
       char* cheatName=(char*)((u32)ccode+4);
@@ -162,8 +162,8 @@ bool CheatCodelist::parseInternal(FILE* aDat,u32 gamecode,u32 crc32)
 
       if (cheatDataLen)
       {
-        _data.push_back(cParsedItem(cheatName,cheatNote,flagItem|((*ccode&0xff000000)?selectValue:0),dataPos+(((char*)ccode+3)-buffer)));
-        if ((*ccode&0xff000000)&&(flagItem&cParsedItem::EOne)) selectValue=0;
+        _data.push_back(cCheatDatItem(cheatName,cheatNote,flagItem|((*ccode&0xff000000)?selectValue:0),dataPos+(((char*)ccode+3)-buffer)));
+        if ((*ccode&0xff000000)&&(flagItem&cCheatDatItem::EOne)) selectValue=0;
         _data.back()._cheat.resize(cheatDataLen);
         tonccpy(_data.back()._cheat.data(),cheatData,cheatDataLen*4);
       }
@@ -181,7 +181,7 @@ void CheatCodelist::generateList(void)
   _indexes.clear();
   // _List.removeAllRows();
 
-  std::vector<cParsedItem>::iterator itr=_data.begin();
+  std::vector<cCheatDatItem>::iterator itr=_data.begin();
   while (itr!=_data.end())
   {
     std::vector<std::string> row;
@@ -191,9 +191,9 @@ void CheatCodelist::generateList(void)
     _indexes.push_back(itr-_data.begin());
     u32 flags=(*itr)._flags;
     ++itr;
-    if ((flags&cParsedItem::EFolder)&&(flags&cParsedItem::EOpen)==0)
+    if ((flags&cCheatDatItem::EFolder)&&(flags&cCheatDatItem::EOpen)==0)
     {
-      while (((*itr)._flags&cParsedItem::EInFolder)&&itr!=_data.end()) ++itr;
+      while (((*itr)._flags&cCheatDatItem::EInFolder)&&itr!=_data.end()) ++itr;
     }
   }
 }
@@ -221,12 +221,22 @@ std::vector<u32> CheatCodelist::getCheats()
   std::vector<u32> cheats;
   for (uint i=0;i<_data.size();i++)
   {
-    if (_data[i]._flags&cParsedItem::ESelected)
+    if (_data[i]._flags&cCheatDatItem::ESelected)
     {
       cheats.insert(cheats.end(),_data[i]._cheat.begin(),_data[i]._cheat.end());
     }
   }
   return cheats;
+}
+
+std::vector<cCheatDatItem> CheatCodelist::getCheatsAlt() {
+    std::vector<cCheatDatItem> cheats;
+    for (uint i = 0; i < _data.size(); i++) {
+        if (_data[i]._flags & cCheatDatItem::ESelected) {
+            cheats.push_back(_data[i]);
+        }
+    }
+    return cheats;
 }
 
 void CheatCodelist::writeCheatsToFile(const char *path) {

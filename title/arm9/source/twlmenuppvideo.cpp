@@ -7,10 +7,10 @@
 
 #include "common/twlmenusettings.h"
 #include "common/systemdetails.h"
-#include "common/flashcard.h"
 #include "common/tonccpy.h"
 #include "common/lodepng.h"
 #include "common/ColorLut.h"
+#include "graphics/fontHandler.h"
 #include "graphics/graphics.h"
 #include "graphics/color.h"
 #include "sound.h"
@@ -85,20 +85,20 @@ extern bool useTwlCfg;
 
 extern u16 convertVramColorToGrayscale(u16 val);
 
-extern u16 frameBuffer[2][256*192];
-extern u16 frameBufferBot[2][256*192];
-extern bool doubleBuffer;
-extern bool doubleBufferTop;
+extern bool multiBuffer;
+extern bool multiBufferTop;
 
 extern bool fadeType;
 extern bool fadeColor;
 extern bool controlTopBright;
 
+static int currentFrame = 0;
 static int frameDelaySprite = 0;
 static bool frameDelaySpriteEven = true;	// For 24FPS or 48FPS
 static bool loadFrameSprite = true;
 static bool longVersion = false;
-static bool highFPS = false; // 75FPS
+extern bool highFPS;
+extern int bufferCount;
 
 /*static int anniversaryTextYpos = -14;
 static bool anniversaryTextYposMove = false;
@@ -128,6 +128,7 @@ static u16 twlColors[16] = {
 static int zoomingIconXpos[12] = {-32, -32, 256, 256+16, -32, -32, 256, 256+16, -32, -32, 256+16, 256+40};
 static int zoomingIconYpos[12] = {-32, -48, -48, -32, 192+32, 192+48, 192+48, 192+32, -32, 192, -32, 192+48};
 static int gbaIconYpos = 44;
+static bool displayConsoleIcons = true;
 
 void twlMenuVideo_loadTopGraphics(void) {
 	// Anniversary
@@ -176,6 +177,14 @@ void twlMenuVideo_loadTopGraphics(void) {
 	}
 
 	oamInit(&oamMain, SpriteMapping_1D_32, false);
+
+	if (dsiFeatures() && ms().consoleModel >= 2) {
+		const bool nesDSFound = (access(sys().isRunFromSD() ? "sd:/_nds/TWiLightMenu/emulators/nesDS.nds" : "fat:/_nds/TWiLightMenu/emulators/nesDS.nds", F_OK) == 0);
+		if (!emulatorsInstalled || !nesDSFound) {
+			displayConsoleIcons = false;
+			return;
+		}
+	}
 
 	u16* gfx[12];
 	for (int i = 0; i < 12; i++) {
@@ -473,6 +482,11 @@ extern bool soundBankInited;
 mm_sound_effect bootJingle;
 
 void twlMenuVideo_topGraphicRender(void) {
+	if (!displayConsoleIcons) {
+		currentFrame++;
+		return;
+	}
+
 	if (!loadFrameSprite) {
 		frameDelaySprite++;
 		if (highFPS) {
@@ -609,7 +623,6 @@ void twlMenuVideo_topGraphicRender(void) {
 		for (int i = 0; i < 12; i++) {
 			oamSetXY(&oamMain, i, zoomingIconXpos[i], zoomingIconYpos[i]);
 		}
-		while (REG_VCOUNT < 88); // Fix/Hide screen tearing
 		oamUpdate(&oamMain);
 
 		frameDelaySprite = 0;
@@ -633,6 +646,8 @@ void twlMenuVideo_topGraphicRender(void) {
 			anniversaryTextYposMove = false;
 		}
 	}*/
+
+	currentFrame++;
 }
 
 void twlMenuVideo(void) {
@@ -645,56 +660,66 @@ void twlMenuVideo(void) {
 	const struct tm *Time = localtime(&Raw);
 
 	strftime(currentDate, sizeof(currentDate), "%m/%d", Time);
+	bool easterEggUsed = false;
 	bool showTwl = true;
 
-	if (strcmp(currentDate, "04/01") == 0) {
-		// Load Starship Menu++ BG
-		sprintf(logoPath, "nitro:/graphics/logo_twlmenuppStarship.png");
-		longVersion = ms().longSplashJingle;
-		showTwl = false;
-	} else if (strncmp(currentDate, "12", 2) == 0) {
-		// Load christmas BG for December
-		sprintf(logoPath, "nitro:/graphics/logo_twlmenuppXmas.png");
-		longVersion = ms().longSplashJingle;
-	} else if (strcmp(currentDate, "10/31") == 0) {
-		// Load orange BG for Halloween
-		sprintf(logoPath, "nitro:/graphics/logo_twlmenuppOrange.png");
-		longVersion = ms().longSplashJingle;
-	} else if (strcmp(currentDate, styleSavvyReleaseDate()) == 0) {
-		// Load Style Savvy BG
-		sprintf(logoPath, "nitro:/graphics/logo_twlmenuppFashion.png");
-		gbaIconYpos -= 8;
-	} else if (strcmp(currentDate, ms().getGameRegion() == 0 ? "07/21" : "08/14") == 0) {
-		// Load Virtual Boy BG
-		sprintf(logoPath, "nitro:/graphics/logo_twlmenuppVirtualBoy.png");
-		longVersion = ms().longSplashJingle;
-	} else if (strcmp(currentDate, "02/14") == 0) {
-		// Load heart-shaped BG for Valentine's Day
-		sprintf(logoPath, "nitro:/graphics/logo_twlmenuppHeart.png");
-		longVersion = ms().longSplashJingle;
-	} else if (strcmp(currentDate, "02/27") == 0) {
-		// Load Pokémon Day BG
-		sprintf(logoPath, "nitro:/graphics/logo_twlmenuppPokemon.png");
-	} else if (strcmp(currentDate, "03/10") == 0 || strcmp(currentDate, sm64dsReleaseDate()) == 0) {
-		// Load Mario-themed BG & logo for MAR10 Day
-		sprintf(logoPath, "nitro:/graphics/logo_twlmenuppMario.png");
-	} else if (strcmp(currentDate, "03/17") == 0 || strcmp(currentDate, "04/22") == 0) {
-		// Load green BG for St. Patrick's Day, or Earth Day
-		sprintf(logoPath, "nitro:/graphics/logo_twlmenuppGreen.png");
-		longVersion = ms().longSplashJingle;
-	} else if (strcmp(currentDate, "04/27") == 0) {
-		// Load Kirby-themed BG & logo for Kirby's anniversary
-		sprintf(logoPath, "nitro:/graphics/logo_twlmenuppKirby.png");
-		longVersion = ms().longSplashJingle;
-	} else if (strcmp(currentDate, "06/11") == 0 || strcmp(currentDate, "09/23") == 0) {
-		// CiTRadvance SRLDSiSion Menu X++ii++++++++oader X++X Menu++ logo for TWiLight's rename days
-		sprintf(logoPath, "nitro:/graphics/logo_twlmenuppCitradvancesrldsisionmenuoadmenu.png");
-		longVersion = ms().longSplashJingle;
-		showTwl = false;
-	} else if (strcmp(currentDate, sonic1ReleaseDate()) == 0) {
-		// Load Sonic-themed BG for Sonic's anniversary
-		sprintf(logoPath, "nitro:/graphics/logo_twlmenuppSonic.png");
-	} else {
+	if (ms().splashEasterEggs) {
+		easterEggUsed = true;
+		if (strcmp(currentDate, "04/01") == 0) {
+			// Load Starship Menu++ BG
+			sprintf(logoPath, "nitro:/graphics/logo_twlmenuppStarship.png");
+			longVersion = ms().longSplashJingle;
+			showTwl = false;
+		} else if (strncmp(currentDate, "12", 2) == 0) {
+			// Load christmas BG for December
+			sprintf(logoPath, "nitro:/graphics/logo_twlmenuppXmas.png");
+			longVersion = ms().longSplashJingle;
+		} else if (strcmp(currentDate, "10/31") == 0) {
+			// Load orange BG for Halloween
+			sprintf(logoPath, "nitro:/graphics/logo_twlmenuppOrange.png");
+			longVersion = ms().longSplashJingle;
+		} else if (strcmp(currentDate, styleSavvyReleaseDate()) == 0) {
+			// Load Style Savvy BG
+			sprintf(logoPath, "nitro:/graphics/logo_twlmenuppFashion.png");
+			gbaIconYpos -= 8; // Shift up GBA icon to not cover the shoe
+		} else if (strcmp(currentDate, ms().getGameRegion() == 0 ? "07/21" : "08/14") == 0) {
+			// Load Virtual Boy BG
+			sprintf(logoPath, "nitro:/graphics/logo_twlmenuppVirtualBoy.png");
+			longVersion = ms().longSplashJingle;
+		} else if (strcmp(currentDate, "02/14") == 0) {
+			// Load heart-shaped BG for Valentine's Day
+			sprintf(logoPath, "nitro:/graphics/logo_twlmenuppHeart.png");
+			longVersion = ms().longSplashJingle;
+		} else if (strcmp(currentDate, "02/21") == 0) {
+			// Load Zelda-themed BG
+			sprintf(logoPath, "nitro:/graphics/logo_twlmenuppZelda.png");
+		} else if (strcmp(currentDate, "02/27") == 0) {
+			// Load Pokémon Day BG
+			sprintf(logoPath, "nitro:/graphics/logo_twlmenuppPokemon.png");
+		} else if (strcmp(currentDate, "03/10") == 0 || strcmp(currentDate, sm64dsReleaseDate()) == 0) {
+			// Load Mario-themed BG & logo for MAR10 Day
+			sprintf(logoPath, "nitro:/graphics/logo_twlmenuppMario.png");
+		} else if (strcmp(currentDate, "03/17") == 0 || strcmp(currentDate, "04/22") == 0) {
+			// Load green BG for St. Patrick's Day, or Earth Day
+			sprintf(logoPath, "nitro:/graphics/logo_twlmenuppGreen.png");
+			longVersion = ms().longSplashJingle;
+		} else if (strcmp(currentDate, "04/27") == 0) {
+			// Load Kirby-themed BG & logo for Kirby's anniversary
+			sprintf(logoPath, "nitro:/graphics/logo_twlmenuppKirby.png");
+			longVersion = ms().longSplashJingle;
+		} else if (strcmp(currentDate, "06/11") == 0 || strcmp(currentDate, "09/23") == 0) {
+			// CiTRadvance SRLDSiSion Menu X++ii++++++++oader X++X Menu++ logo for TWiLight's rename days
+			sprintf(logoPath, "nitro:/graphics/logo_twlmenuppCitradvancesrldsisionmenuoadmenu.png");
+			longVersion = ms().longSplashJingle;
+			showTwl = false;
+		} else if (strcmp(currentDate, sonic1ReleaseDate()) == 0) {
+			// Load Sonic-themed BG for Sonic's anniversary
+			sprintf(logoPath, "nitro:/graphics/logo_twlmenuppSonic.png");
+		} else {
+			easterEggUsed = false;
+		}
+	}
+	if (!easterEggUsed) {
 		// Load normal BG
 		sprintf(logoPath, "nitro:/graphics/logo_twlmenupp.png");
 		longVersion = ms().longSplashJingle;
@@ -703,52 +728,51 @@ void twlMenuVideo(void) {
 	// Load TWLMenu++ logo
 	lodepng::decode(image, width, height, logoPath);
 	bool alternatePixel = false;
-	for (unsigned i=0;i<image.size()/4;i++) {
-		image[(i*4)+3] = 0;
-		if (alternatePixel) {
-			if (image[(i*4)] >= 0x4 && image[(i*4)] < 0xFC) {
-				image[(i*4)] += 0x4;
-				image[(i*4)+3] |= BIT(0);
+	bool alternatePixel2 = false;
+	bool alternatePixel3 = false;
+	for (int b = 0; b < bufferCount; b++) {
+		for (unsigned i=0;i<image.size()/4;i++) {
+			const u8 oldR = image[(i*4)];
+			const u8 oldG = image[(i*4)+1];
+			const u8 oldB = image[(i*4)+2];
+			u8 newR = oldR;
+			u8 newG = oldG;
+			u8 newB = oldB;
+			if (alternatePixel) {
+				if (oldR >= 4 && oldR < 0xFC) newR += 4;
+				if (oldG >= 4 && oldG < 0xFC) newG += 4;
+				if (oldB >= 4 && oldB < 0xFC) newB += 4;
 			}
-			if (image[(i*4)+1] >= 0x4 && image[(i*4)+1] < 0xFC) {
-				image[(i*4)+1] += 0x4;
-				image[(i*4)+3] |= BIT(1);
+			if (alternatePixel2) {
+				if (oldR >= 2 && newR < 0xFE) newR += 2;
+				if (oldG >= 2 && newG < 0xFE) newG += 2;
+				if (oldB >= 2 && newB < 0xFE) newB += 2;
 			}
-			if (image[(i*4)+2] >= 0x4 && image[(i*4)+2] < 0xFC) {
-				image[(i*4)+2] += 0x4;
-				image[(i*4)+3] |= BIT(2);
+			if (alternatePixel3) {
+				if (oldR >= 1 && newR < 0xFF) newR++;
+				if (oldG >= 1 && newG < 0xFF) newG++;
+				if (oldB >= 1 && newB < 0xFF) newB++;
 			}
+			frameBuffer[b][i] = newR>>3 | (newG>>3)<<5 | (newB>>3)<<10 | BIT(15);
+			if ((i % 256) == 255) {
+				alternatePixel = !alternatePixel;
+				alternatePixel2 = !alternatePixel2;
+			}
+			alternatePixel = !alternatePixel;
+			alternatePixel2 = !alternatePixel2;
 		}
-		frameBuffer[0][i] = image[i*4]>>3 | (image[(i*4)+1]>>3)<<5 | (image[(i*4)+2]>>3)<<10 | BIT(15);
-		if (alternatePixel) {
-			if (image[(i*4)+3] & BIT(0)) {
-				image[(i*4)] -= 0x4;
-			}
-			if (image[(i*4)+3] & BIT(1)) {
-				image[(i*4)+1] -= 0x4;
-			}
-			if (image[(i*4)+3] & BIT(2)) {
-				image[(i*4)+2] -= 0x4;
-			}
-		} else {
-			if (image[(i*4)] >= 0x4 && image[(i*4)] < 0xFC) {
-				image[(i*4)] += 0x4;
-			}
-			if (image[(i*4)+1] >= 0x4 && image[(i*4)+1] < 0xFC) {
-				image[(i*4)+1] += 0x4;
-			}
-			if (image[(i*4)+2] >= 0x4 && image[(i*4)+2] < 0xFC) {
-				image[(i*4)+2] += 0x4;
-			}
-		}
-		frameBuffer[1][i] = image[i*4]>>3 | (image[(i*4)+1]>>3)<<5 | (image[(i*4)+2]>>3)<<10 | BIT(15);
-		if ((i % 256) == 255) alternatePixel = !alternatePixel;
 		alternatePixel = !alternatePixel;
+		if (b == 1) {
+			alternatePixel2 = !alternatePixel2;
+		}
+		if (highFPS) {
+			alternatePixel3 = !alternatePixel3;
+		}
 	}
 	image.clear();
 
-	doubleBuffer = true;
-	doubleBufferTop = true;
+	multiBuffer = true;
+	multiBufferTop = true;
 
 	if (showTwl) {
 		lodepng::decode(image, width, height, "nitro:/graphics/TWL.png");
@@ -783,8 +807,9 @@ void twlMenuVideo(void) {
 			}
 			const u16 val = *(src++);
 			if (image[(i*4)+3] > 0) {
-				frameBuffer[0][y*256+x] = val;
-				frameBuffer[1][y*256+x] = val;
+				for (int b = 0; b < bufferCount; b++) {
+					frameBuffer[b][y*256+x] = val;
+				}
 			}
 			x++;
 		}
@@ -795,13 +820,14 @@ void twlMenuVideo(void) {
 	}
 
 	if (colorTable) {
-		for (int i=0; i<256*192; i++) {
-			frameBuffer[0][i] = colorTable[frameBuffer[0][i] % 0x8000] | BIT(15);
-			frameBuffer[1][i] = colorTable[frameBuffer[1][i] % 0x8000] | BIT(15);
+		for (int b = 0; b < bufferCount; b++) {
+			for (int i=0; i<256*192; i++) {
+				frameBuffer[b][i] = colorTable[frameBuffer[b][i] % 0x8000] | BIT(15);
+			}
 		}
 	}
 
-	highFPS = ((sys().isRegularDS() && !sys().isDSPhat()) || ((dsiFeatures() || sdFound()) && ms().consoleModel < 2));
+	const int frameCount = (highFPS ? (longVersion ? ((72 * 6) + 30) : (72 * 3)) : (longVersion ? ((60 * 6) + 35) : (60 * 3)));
 
 	if (highFPS) {
 		*(u32*)(0x2FFFD0C) = 0x43535046;
@@ -819,13 +845,14 @@ void twlMenuVideo(void) {
 	extern bool twlMenuSplash;
 	twlMenuSplash = true;
 
-	const int iEnd = (highFPS ? (longVersion ? ((72 * 6) + 30) : (72 * 3)) : (longVersion ? ((60 * 6) + 35) : (60 * 3)));
-	for (int i = 0; i < iEnd; i++) {
+	fontInit(true);
+
+	while (currentFrame < frameCount) {
 		scanKeys();
-		if ((keysHeld() & KEY_START) || (keysHeld() & KEY_SELECT) || (keysHeld() & KEY_TOUCH)) return;
+		const int held = keysHeld();
+		if ((held & KEY_A) || (held & KEY_START) || (held & KEY_SELECT) || (held & KEY_TOUCH)) return;
 		//loadROMselectAsynch();
 		snd().updateStream();
-		twlMenuVideo_topGraphicRender();
 		swiWaitForVBlank();
 	}
 }

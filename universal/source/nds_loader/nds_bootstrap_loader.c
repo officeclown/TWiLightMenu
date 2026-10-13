@@ -98,7 +98,7 @@ char* hbLoad_bin = (char*)0x02FC0000;
 char* hbLoadInject_bin = (char*)0x02FD0000;
 char* imgTemplateBuffer = (char*)0x02FB0000;
 
-int bootstrapHbRunNds (const void* loader, u32 loaderSize, u32 cluster, u32 ramDiskCluster, u32 ramDiskSize, u32 srParamsCluster, u32 patchOffsetCacheCluster, u32 cfgCluster, u32 cfgSize, int romToRamDisk, bool romIsCompressed, bool initDisc, bool dldiPatchNds, int argc, const char** argv, int language, int dsiMode, bool boostCpu, bool boostVram, int consoleModel, bool soundFreq, u32 srTid1, u32 srTid2, bool ndsPreloaded)
+int bootstrapHbRunNds (const void* loader, u32 loaderSize, u32 cluster, u32 ramDiskCluster, u32 ramDiskSize, u32 srParamsCluster, u32 patchOffsetCacheCluster, u32 cfgCluster, u32 cfgSize, int romToRamDisk, bool romIsCompressed, bool initDisc, bool dldiPatchNds, int argc, const char** argv, int language, int dsiMode, bool boostCpu, bool boostVram, int consoleModel, bool soundFreq, bool ndsPreloaded)
 {
 	char* argStart;
 	u16* argData;
@@ -164,11 +164,6 @@ int bootstrapHbRunNds (const void* loader, u32 loaderSize, u32 cluster, u32 ramD
 	}
 	*argData = argTempVal;
 	
-	writeAddr ((data_t*) LCDC_BANK_C, 0x24, consoleModel);
-	writeAddr ((data_t*) LCDC_BANK_C, 0x28, srParamsCluster);
-	writeAddr ((data_t*) LCDC_BANK_C, 0x2C, srTid1);
-	writeAddr ((data_t*) LCDC_BANK_C, 0x30, srTid2);
-
 	writeAddr ((data_t*) LCDC_BANK_D, ARG_START_OFFSET, (addr_t)argStart - (addr_t)LCDC_BANK_D);
 	writeAddr ((data_t*) LCDC_BANK_D, ARG_SIZE_OFFSET, argSize);
 	writeAddr ((data_t*) LCDC_BANK_D, LANGUAGE_OFFSET, language);
@@ -222,7 +217,6 @@ int bootstrapHbRunNdsFile (const char* filename, const char* fatFilename, const 
 		return 3;
 	}
 
-	u32 srBackendId[2] = {0};
 	struct stat st;
 	struct stat stRam;
 	struct stat stCfg;
@@ -232,9 +226,6 @@ int bootstrapHbRunNdsFile (const char* filename, const char* fatFilename, const 
 	u32 clusterCfg = 0;
 	u32 clusterPatchCache = 0;
 	u32 clusterSr = 0;
-	char filePath[PATH_MAX];
-	int pathLen;
-	const char* args[1];
 
 	if (romIsCompressed) {
 		FILE *ramDiskTemplate = fopen(ramDiskFilename, "rb");
@@ -278,22 +269,9 @@ int bootstrapHbRunNdsFile (const char* filename, const char* fatFilename, const 
 	}
 
 	if (argc <= 0 || !argv) {
-		// Construct a command line if we weren't supplied with one
-		if (!getcwd (filePath, PATH_MAX)) {
-			//free(hbLoad_bin);
-			//free(hbLoadInject_bin);
-			return 2;
-		}
-		pathLen = strlen (filePath);
-		strcpy (filePath + pathLen, fatFilename);
-		args[0] = filePath;
-		argv = args;
-	}
-
-	FILE* srBackendBin = fopen("sd:/_nds/nds-bootstrap/srBackendId.bin", "rb");
-	if (srBackendBin) {
-		fread(&srBackendId, sizeof(u32), 2, srBackendBin);
-		fclose(srBackendBin);
+		//free(hbLoad_bin);
+		//free(hbLoadInject_bin);
+		return 2;
 	}
 
 	//bool havedsiSD = false;
@@ -302,7 +280,7 @@ int bootstrapHbRunNdsFile (const char* filename, const char* fatFilename, const 
 	
 	//installBootStub(havedsiSD);
 
-	return bootstrapHbRunNds (hbLoad_bin, 0x10000, st.st_ino, clusterRam, ramDiskSize, clusterSr, clusterPatchCache, clusterCfg, cfgSize, romToRamDisk, romIsCompressed, true, true, argc, argv, language, dsiMode, boostCpu, boostVram, consoleModel, soundFreq, srBackendId[0], srBackendId[1], ndsPreloaded);
+	return bootstrapHbRunNds (hbLoad_bin, 0x10000, st.st_ino, clusterRam, ramDiskSize, clusterSr, clusterPatchCache, clusterCfg, cfgSize, romToRamDisk, romIsCompressed, true, true, argc, argv, language, dsiMode, boostCpu, boostVram, consoleModel, soundFreq, ndsPreloaded);
 }
 
 void bootstrapHbRunPrep (int romToRamDisk) {

@@ -67,6 +67,7 @@ void soundFadeIn() {
 void ReturntoDSiMenu() {
 //---------------------------------------------------------------------------------
 	if (isDSiMode() && !i2cBricked) {
+		i2cWriteRegister(0x4A, 0x12, i2cReadRegister(0x4A, 0x12) | 1); // 3DS - is_twl - Do not trust gbatek for this register - Thanks TuxSH!
 		i2cWriteRegister(0x4A, 0x70, 0x01);		// Bootflag = Warmboot/SkipHealthSafety
 		i2cWriteRegister(0x4A, 0x11, 0x01);		// Reset to DSi Menu
 	} else {
@@ -79,6 +80,9 @@ void ReturntoDSiMenu() {
 //---------------------------------------------------------------------------------
 void VblankHandler(void) {
 //---------------------------------------------------------------------------------
+	void my_inputGetAndSend(void);
+	my_inputGetAndSend();
+
 	if (*(int*)0x02003004 == 2) {
 		soundFadeIn();
 	} else if (*(int*)0x02003004 == 1) {
@@ -90,11 +94,12 @@ void VblankHandler(void) {
 }
 
 //---------------------------------------------------------------------------------
-void VcountHandler() {
+void VcountHandler(void) {
 //---------------------------------------------------------------------------------
-	void my_inputGetAndSend(void);
-	my_inputGetAndSend();
+	// Change FPS to 76
+	REG_VCOUNT += 56;
 }
+
 
 volatile bool exitflag = false;
 
@@ -137,15 +142,11 @@ int main() {
 
 	mmInstall(FIFO_MAXMOD);
 
-	SetYtrigger(80);
-
 	installSoundFIFO();
 	my_installSystemFIFO();
 
-	irqSet(IRQ_VCOUNT, VcountHandler);
 	irqSet(IRQ_VBLANK, VblankHandler);
-
-	irqEnable(IRQ_VBLANK | IRQ_VCOUNT);
+	irqEnable(IRQ_VBLANK);
 
 	setPowerButtonCB(powerButtonCB);
 
@@ -194,6 +195,13 @@ int main() {
 				status = (status & ~SD_MASK) | ((1 << SD_OFF) & SD_MASK);
 				fifoSendValue32(FIFO_USER_03, status);
 			}
+		}
+		if (*(u32*)(0x2FFFD0C) == 0x43535046) {
+			SetYtrigger(202);
+			irqSet(IRQ_VCOUNT, VcountHandler);
+			irqEnable(IRQ_VCOUNT);
+
+			*(u32*)(0x2FFFD0C) = 0;
 		}
 		if (fifoCheckValue32(FIFO_USER_02)) {
 			ReturntoDSiMenu();

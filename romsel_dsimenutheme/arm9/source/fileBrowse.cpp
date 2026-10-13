@@ -33,6 +33,9 @@
 
 #include "common/twlmenusettings.h"
 #include "common/bootstrapsettings.h"
+#include "common/customLaunchers.h"
+#include "common/dlplayPatch.h"
+#include "launch/launchExecutor.h"
 #include "common/flashcard.h"
 #include "common/inifile.h"
 #include "common/logging.h"
@@ -101,7 +104,9 @@ extern int titlewindowXpos[2];
 extern int titlewindowXdest[2];
 extern int titleboxXspeed;
 extern int titleboxXspacing;
+extern int titleboxYpos;
 int movingApp = -1;
+int movingAppXpos = 96; // Screen x of the carried box; 96 == centred on the gap it left
 int movingAppYpos = 0;
 bool movingAppIsDir = false;
 bool draggingIcons = false;
@@ -149,6 +154,8 @@ extern bool createDSiWareSave(const char *path, int size);
 extern void createSaveFile(const char* savePath, const bool isHomebrew, const char* gameTid);
 
 extern bool rocketVideo_playVideo;
+extern bool rocketVideo_topVisible;
+extern bool rocketVideo_weaveRefill;
 
 extern void bgOperations(bool waitFrame);
 
@@ -342,28 +349,33 @@ void getDirectoryContents(std::vector<DirEntry> &dirContents, const std::vector<
 				emplaceBackDirContent = (pent->d_type != DT_DIR && nameEndsWith(pent->d_name, extensionList));
 			}
 			if (emplaceBackDirContent) {
-				if ((pent->d_type != DT_DIR) && extension(pent->d_name, {".md"})) {
-					FILE* mdFile = fopen(pent->d_name, "rb");
-					if (mdFile) {
-						u8 segaEntryPointReversed[4] = {0};
-						u8 segaEntryPointU8[4] = {0};
-						u32 segaEntryPoint = 0;
-						fseek(mdFile, 4, SEEK_SET);
-						fread(&segaEntryPointReversed, 1, 4, mdFile);
-						for (int i = 0; i < 4; i++) {
-							segaEntryPointU8[3-i] = segaEntryPointReversed[i];
-						}
-						tonccpy(&segaEntryPoint, segaEntryPointU8, 4);
+				if (pent->d_type != DT_DIR) {
+					if (extension(pent->d_name, {".md"})) {
+						FILE* mdFile = fopen(pent->d_name, "rb");
+						if (mdFile) {
+							u8 segaEntryPointReversed[4] = {0};
+							u8 segaEntryPointU8[4] = {0};
+							u32 segaEntryPoint = 0;
+							fseek(mdFile, 4, SEEK_SET);
+							fread(&segaEntryPointReversed, 1, 4, mdFile);
+							for (int i = 0; i < 4; i++) {
+								segaEntryPointU8[3-i] = segaEntryPointReversed[i];
+							}
+							tonccpy(&segaEntryPoint, segaEntryPointU8, 4);
 
-						char segaString[5] = {0};
-						fseek(mdFile, 0x100, SEEK_SET);
-						fread(segaString, 1, 4, mdFile);
-						fclose(mdFile);
+							char segaString[5] = {0};
+							fseek(mdFile, 0x100, SEEK_SET);
+							fread(segaString, 1, 4, mdFile);
+							fclose(mdFile);
 
-						if (!((segaEntryPointReversed[0] == 0) && ((strcmp(segaString, "SEGA") == 0) || ((segaEntryPoint >= 8) && (segaEntryPoint < 0x3FFFFF))))) {
-							// Invalid string or entry point found
-							continue;
+							if (!((segaEntryPointReversed[0] == 0) && ((strcmp(segaString, "SEGA") == 0) || ((segaEntryPoint >= 8) && (segaEntryPoint < 0x3FFFFF))))) {
+								// Invalid string or entry point found
+								continue;
+							}
 						}
+					} else if (!ms().macroMode && extension(pent->d_name, {"_bot.gif", "_bot.bmp", "_bot.png"})) {
+						// Do not show bottom screen images seperately if macro mode is turned off
+						continue;
 					}
 				}
 				dirContents.emplace_back(pent->d_name, ms().showDirectories ? (pent->d_type == DT_DIR) : false, file_count, false);
@@ -483,6 +495,67 @@ void displayNowLoading(void) {
 	showProgressIcon = true;
 }
 
+// Refreshes every icon bank the grid can sample this frame.
+//
+// The draw loop in graphics.cpp draws list entries
+// [CURPOS - ICON_GRID_MAX_OFFSET, CURPOS + ICON_GRID_MAX_OFFSET] clamped to
+// [0, 39], and maps each to bank ICON_GRID_BANK(pos). That window is exactly
+// ICON_GRID_BANKS wide, so the clamp below is deliberately the same expression
+// as the draw loop's: it loads the banks the draw loop reads and nothing else.
+// Do not widen it, do not re-anchor it to stay full width at the list ends, and
+// do not pass anything but the absolute grid position as iconUpdate()'s third
+// argument -- each of those silently decouples the load window from the draw
+// window again, which is what left the leftmost box rendering another entry's
+// icon.
+//
+// waitVBlank is for the "Now Loading" paths, which want a frame between reads so
+// the progress bar animates. The touch and drag paths must pass false, or they
+// stall the scroll by a vblank per icon.
+static void refreshGridIcons(const std::vector<DirEntry> &entries, int centre, bool waitVBlank) {
+	const int first = std::max(centre - ICON_GRID_MAX_OFFSET, 0);
+	const int last = std::min(centre + ICON_GRID_MAX_OFFSET, 39);
+
+	for (int pos = first; pos <= last; pos++) {
+		const int idx = pos + PAGENUM * 40;
+		// idx only increases, so nothing further can be in range.
+		if (idx >= file_count || idx >= (int)entries.size())
+			break;
+		if (waitVBlank)
+			bgOperations(true);
+		iconUpdate(entries[idx].isDirectory, entries[idx].name.c_str(), pos);
+	}
+}
+
+static inline void refreshGridIcons(SwitchState scrn, const std::vector<std::vector<DirEntry>> &dirContents,
+					int centre, bool waitVBlank) {
+	refreshGridIcons(dirContents[scrn], centre, waitVBlank);
+}
+
+// The non-blocking half of moveCursor(), for the stylus drag. moveCursor spins
+// for ~12 frames per step (8 animating titleboxXdest, then the first-move delay),
+// during which the carried box would freeze and a release would go unseen. This
+// does the same O(1) work -- step the insertion point, uncover the one icon that
+// step reveals -- and leaves the scroll to the vblank easing.
+//
+// Deliberately does not set draggingIcons: the easing in vBlankHandler is what
+// animates titleboxXpos towards titleboxXdest here, and draggingIcons disables it.
+static void moveHeldCursor(bool right, const std::vector<DirEntry> &entries) {
+	CURPOS += right ? 1 : -1;
+
+	// Same one-entry refresh as moveCursor, including the clamp to 39.
+	const int pos = CURPOS + (right ? ICON_GRID_MAX_OFFSET : -ICON_GRID_MAX_OFFSET);
+	if (pos >= 0 && pos <= 39 && pos + PAGENUM * 40 < (int)entries.size()) {
+		iconUpdate(entries[pos + PAGENUM * 40].isDirectory,
+				   entries[pos + PAGENUM * 40].name.c_str(), pos);
+	}
+
+	titleboxXdest[ms().secondaryDevice] = CURPOS * titleboxXspacing;
+	titlewindowXdest[ms().secondaryDevice] = CURPOS * 5;
+
+	snd().playSelect();
+	settingsChanged = true;
+}
+
 void moveCursor(bool right, const std::vector<DirEntry> dirContents, int maxEntry = 0xFFFF) {
 	if ((right && CURPOS >= last_used_box) || (!right && CURPOS <= 0)) {
 		if (ms().theme != TWLSettings::EThemeSaturn && !edgeBumpSoundPlayed)
@@ -532,8 +605,15 @@ void moveCursor(bool right, const std::vector<DirEntry> dirContents, int maxEntr
 			updateText(false);
 		}
 
-		int pos = CURPOS + (right ? 2 : -2);
-		if (pos >= 0 && pos + PAGENUM * 40 < (int)dirContents.size()) {
+		// Only one entry is newly uncovered by the cursor step; it evicts the
+		// bank of the entry that just fell off the far side. Keep this O(1)
+		// rather than calling refreshGridIcons, which would turn one SD read
+		// per keypress into ICON_GRID_BANKS of them.
+		// Clamp to 39: iconUpdate() indexes the [41] per-slot arrays, and index 40
+		// is the moving app's own cache, so an unclamped pos would clobber the
+		// carried entry (pos == 40) or run off the end (pos == 41/42).
+		int pos = CURPOS + (right ? ICON_GRID_MAX_OFFSET : -ICON_GRID_MAX_OFFSET);
+		if (pos >= 0 && pos <= 39 && pos + PAGENUM * 40 < (int)dirContents.size()) {
 			iconUpdate(dirContents[pos + PAGENUM * 40].isDirectory,
 						dirContents[pos + PAGENUM * 40].name.c_str(),
 						pos);
@@ -576,9 +656,13 @@ void moveCursor(bool right, const std::vector<DirEntry> dirContents, int maxEntr
 		if (firstMove) {
 			firstMove = false;
 			if (boxArtLoaded) {
-				if (!rocketVideo_playVideo)
+				if (!rocketVideo_topVisible)
 					clearBoxArt();
-				rocketVideo_playVideo = (ms().theme == TWLSettings::ETheme3DS) ? true : false;
+				if (ms().theme == TWLSettings::ETheme3DS) {
+					resumeRotatingCubesVideo();
+				} else {
+					rocketVideo_playVideo = false;
+				}
 				boxArtLoaded = false;
 				if (ms().theme == TWLSettings::EThemeSaturn) {
 					for (int i = 0; i < 10; i++)
@@ -620,13 +704,21 @@ void updateBoxArt(void) {
 		clearBoxArt();
 	}
 
-	sprintf(boxArtPath, "%s:/_nds/TWiLightMenu/boxart/%s.png", sys().isRunFromSD() ? "sd" : "fat", boxArtFilename);
-	if (!isDirectory[CURPOS] && (bnrRomType[CURPOS] == 0) && (access(boxArtPath, F_OK) != 0)) {
-		sprintf(boxArtPath, "%s:/_nds/TWiLightMenu/boxart/%s.png", sys().isRunFromSD() ? "sd" : "fat", gameTid[CURPOS]);
+	sprintf(boxArtPath, "%s:/_nds/TWiLightMenu/boxart/%s.bmp", sys().isRunFromSD() ? "sd" : "fat", boxArtFilename);
+	if (access(boxArtPath, F_OK) != 0) {
+		sprintf(boxArtPath, "%s:/_nds/TWiLightMenu/boxart/%s.png", sys().isRunFromSD() ? "sd" : "fat", boxArtFilename);
+	}
+	if (!isDirectory[CURPOS] && (bnrRomType[CURPOS] == 0)) {
+		if (access(boxArtPath, F_OK) != 0) {
+			sprintf(boxArtPath, "%s:/_nds/TWiLightMenu/boxart/%s.bmp", sys().isRunFromSD() ? "sd" : "fat", gameTid[CURPOS]);
+		}
+		if (access(boxArtPath, F_OK) != 0) {
+			sprintf(boxArtPath, "%s:/_nds/TWiLightMenu/boxart/%s.png", sys().isRunFromSD() ? "sd" : "fat", gameTid[CURPOS]);
+		}
 	}
 	if (!tex().drawBoxArt(boxArtPath, (dsiFeatures() && ms().showBoxArt == 2))) { // Load box art
-		if (ms().theme == TWLSettings::ETheme3DS && !rocketVideo_playVideo) {
-			rocketVideo_playVideo = true;
+		if (ms().theme == TWLSettings::ETheme3DS && !rocketVideo_topVisible) {
+			resumeRotatingCubesVideo();
 		}
 	}
 	boxArtLoaded = true;
@@ -646,7 +738,7 @@ void launchDsClassicMenu(void) {
 	ms().saveSettings();
 	// Launch DS Classic Menu
 	argarray.push_back((char*)(sys().isRunFromSD() ? "sd:/_nds/TWiLightMenu/mainmenu.srldr" : "fat:/_nds/TWiLightMenu/mainmenu.srldr"));
-	int err = runNdsFile(argarray[0], argarray.size(), (const char**)&argarray[0], sys().isRunFromSD(), true, false, false, true, true, false, -1);
+	int err = runNdsFile(argarray[0], argarray.size(), (const char**)&argarray[0], sys().isRunFromSD(), true, false, false, true, true, false, -1, sys().commonCache());
 	char text[32];
 	snprintf(text, sizeof(text), STR_START_FAILED_ERROR.c_str(), err);
 	fadeType = true;
@@ -667,7 +759,7 @@ void launchSettings(void) {
 	ms().saveSettings();
 	// Launch TWLMenu++ Settings
 	argarray.push_back((char*)(sys().isRunFromSD() ? "sd:/_nds/TWiLightMenu/settings.srldr" : "fat:/_nds/TWiLightMenu/settings.srldr"));
-	int err = runNdsFile(argarray[0], argarray.size(), (const char**)&argarray[0], sys().isRunFromSD(), true, false, false, true, true, false, -1);
+	int err = runNdsFile(argarray[0], argarray.size(), (const char**)&argarray[0], sys().isRunFromSD(), true, false, false, true, true, false, -1, sys().commonCache());
 	char text[32];
 	snprintf(text, sizeof(text), STR_START_FAILED_ERROR.c_str(), err);
 	fadeType = true;
@@ -675,10 +767,53 @@ void launchSettings(void) {
 	stop();
 }
 
-void launchPictochat(const vector<DirEntry>& dirContents) {
-	const char* pictochatPath = sys().isRunFromSD() ? "sd:/_nds/pictochat.nds" : "fat:/_nds/pictochat.nds";
+extern void writeSoftResetId(void);
 
-	if (access(pictochatPath, F_OK) != 0) {
+extern char pictochatPath[256];
+extern char dlplayPath[256];
+extern bool pictochatFound;
+extern bool dlplayFound;
+extern bool pictochatReboot;
+extern bool dlplayReboot;
+
+/**
+ * Reboot into a DSi system title, booted via Launcher.
+ * @param tidLow Low title ID of the title, with its last byte set to the console region.
+ */
+static void rebootIntoSystemTitle(u32 tidLow) {
+	tidLow &= ~0xFF;
+	switch (ms().sysRegion) {
+		case 4:
+			tidLow |= 'C';
+			break;
+		case 5:
+			tidLow |= 'K';
+			break;
+		default:
+			tidLow |= 'A';
+	}
+
+	*(u32*)(0x02000300) = 0x434E4C54; // Set "CNLT" warmboot flag
+	*(u16*)(0x02000304) = 0x1801;
+	*(u32*)(0x02000308) = tidLow;
+	*(u32*)(0x0200030C) = 0x00030005;
+	*(u32*)(0x02000310) = tidLow;
+	*(u32*)(0x02000314) = 0x00030005;
+	*(u32*)(0x02000318) = 0x00000017;
+	*(u32*)(0x0200031C) = 0x00000000;
+	*(u16*)(0x02000306) = swiCRC16(0xFFFF, (void *)0x02000308, 0x18);
+
+	if (ms().consoleModel < 2) {
+		unlaunchSetHiyaBoot();
+	}
+
+	DC_FlushAll();						// Make reboot not fail
+	fifoSendValue32(FIFO_USER_02, 1); // Reboot into DSiWare title, booted via Launcher
+	for (int i = 0; i < 15; i++) swiWaitForVBlank();
+}
+
+void launchPictochat(const vector<DirEntry>& dirContents) {
+	if (!pictochatFound) {
 		if (ms().theme == TWLSettings::EThemeSaturn) {
 			snd().playStartup();
 			fadeType = false;	   // Fade to black
@@ -752,8 +887,10 @@ void launchPictochat(const vector<DirEntry>& dirContents) {
 	snd().stopStream();
 	ms().saveSettings();
 	// Launch Pictochat
-	if ((!dsiFeatures() || bs().b4dsMode) && ms().secondaryDevice) {
-		int err = runNdsFile(pictochatPath, 0, NULL, sys().isRunFromSD(), true, true, true, false, false, false, ms().gameLanguage);
+	if (pictochatReboot) {
+		rebootIntoSystemTitle(0x484E4541);	// "HNEA"
+	} else if ((!dsiFeatures() || bs().b4dsMode) && ms().secondaryDevice) {
+		int err = runNdsFile(pictochatPath, 0, NULL, sys().isRunFromSD(), true, true, true, false, false, false, ms().gameLanguage, 0);
 		char text[32];
 		snprintf(text, sizeof(text), STR_START_FAILED_ERROR.c_str(), err);
 		fadeType = true;
@@ -771,13 +908,14 @@ void launchPictochat(const vector<DirEntry>& dirContents) {
 		}
 		std::vector<char*> argarray;
 		argarray.push_back((char*)(sys().isRunFromSD() ? "sd:/_nds/TWiLightMenu/dsimenu.srldr" : "fat:/_nds/TWiLightMenu/dsimenu.srldr"));
-		runNdsFile(argarray[0], argarray.size(), (const char**)&argarray[0], sys().isRunFromSD(), true, false, false, true, true, false, -1);
+		runNdsFile(argarray[0], argarray.size(), (const char**)&argarray[0], sys().isRunFromSD(), true, false, false, true, true, false, -1, sys().commonCache());
 	} else {
 		char ndsToBoot[256];
 		sprintf(ndsToBoot, "%s:/_nds/nds-bootstrap-%s.nds", sys().isRunFromSD() ? "sd" : "fat", ms().bootstrapFile ? "nightly" : "release");
 		if (access(ndsToBoot, F_OK) != 0) {
 			sprintf(ndsToBoot, "%s:/_nds/nds-bootstrap-%s.nds", sys().isRunFromSD() ? "fat" : "sd", ms().bootstrapFile ? "nightly" : "release");
 		}
+		writeSoftResetId();
 
 		std::vector<char*> argarray;
 		argarray.push_back(ndsToBoot);
@@ -807,7 +945,7 @@ void launchPictochat(const vector<DirEntry>& dirContents) {
 		bootstrapini.SetInt("NDS-BOOTSTRAP", "REMAPPED_KEY_X", 10);
 		bootstrapini.SetInt("NDS-BOOTSTRAP", "REMAPPED_KEY_Y", 11);
 		bootstrapini.SaveIniFile(bootstrapinipath);
-		int err = runNdsFile(argarray[0], argarray.size(), (const char **)&argarray[0], sys().isRunFromSD(), true, true, false, true, true, false, -1);
+		int err = runNdsFile(argarray[0], argarray.size(), (const char **)&argarray[0], sys().isRunFromSD(), true, true, false, true, true, false, -1, 0);
 		char text[32];
 		snprintf(text, sizeof(text), STR_START_FAILED_ERROR.c_str(), err);
 		printLarge(false, 4, 4, text);
@@ -835,15 +973,13 @@ void launchPictochat(const vector<DirEntry>& dirContents) {
 			argarray.erase(argarray.begin());
 		// }
 		argarray.push_back((char*)(sys().isRunFromSD() ? "sd:/_nds/TWiLightMenu/dsimenu.srldr" : "fat:/_nds/TWiLightMenu/dsimenu.srldr"));
-		runNdsFile(argarray[0], argarray.size(), (const char**)&argarray[0], sys().isRunFromSD(), true, false, false, true, true, false, -1);
+		runNdsFile(argarray[0], argarray.size(), (const char**)&argarray[0], sys().isRunFromSD(), true, false, false, true, true, false, -1, sys().commonCache());
 	}
 	stop();
 }
 
 void launchDownloadPlay(const vector<DirEntry>& dirContents) {
-	const char* dlplayPath = sys().isRunFromSD() ? "sd:/_nds/dlplay.nds" : "fat:/_nds/dlplay.nds";
-
-	if ((!isDSiMode() || ms().consoleModel < 2) && access(dlplayPath, F_OK) != 0) {
+	if (!dlplayFound) {
 		if (ms().theme == TWLSettings::EThemeSaturn) {
 			snd().playStartup();
 			fadeType = false;	   // Fade to black
@@ -917,41 +1053,17 @@ void launchDownloadPlay(const vector<DirEntry>& dirContents) {
 	snd().stopStream();
 	ms().saveSettings();
 	// Launch DS Download Play
-	if (isDSiMode() && (sys().arm7SCFGLocked() || (ms().consoleModel >= 2 && access(dlplayPath, F_OK) != 0))) {
-		*(u32*)(0x02000300) = 0x434E4C54; // Set "CNLT" warmboot flag
-		*(u16*)(0x02000304) = 0x1801;
+	char patchedPath[256];
+	const char* bootPath = dlplayPath;
+	if (!dlplayReboot && ms().dlplayRsaPatch) {
+		snprintf(patchedPath, sizeof(patchedPath), "%s", sys().isRunFromSD() ? "sd:/_nds/dlplay_rsapatch.nds" : "fat:/_nds/dlplay_rsapatch.nds");
+		bootPath = dlplayGetBootPath(dlplayPath, patchedPath);
+	}
 
-		switch (ms().sysRegion) {
-			case 4:
-				*(u32*)(0x02000308) = 0x484E4443;
-				*(u32*)(0x0200030C) = 0x00030005;
-				*(u32*)(0x02000310) = 0x484E4443;
-				break;
-			case 5:
-				*(u32*)(0x02000308) = 0x484E444B;
-				*(u32*)(0x0200030C) = 0x00030005;
-				*(u32*)(0x02000310) = 0x484E444B;
-				break;
-			default:
-				*(u32*)(0x02000308) = 0x484E4441;	// "HNDA"
-				*(u32*)(0x0200030C) = 0x00030005;
-				*(u32*)(0x02000310) = 0x484E4441;	// "HNDA"
-		}
-
-		*(u32*)(0x02000314) = 0x00030005;
-		*(u32*)(0x02000318) = 0x00000017;
-		*(u32*)(0x0200031C) = 0x00000000;
-		*(u16*)(0x02000306) = swiCRC16(0xFFFF, (void *)0x02000308, 0x18);
-
-		if (ms().consoleModel < 2) {
-			unlaunchSetHiyaBoot();
-		}
-
-		DC_FlushAll();						// Make reboot not fail
-		fifoSendValue32(FIFO_USER_02, 1); // Reboot into DSiWare title, booted via Launcher
-		for (int i = 0; i < 15; i++) swiWaitForVBlank();
+	if (dlplayReboot) {
+		rebootIntoSystemTitle(0x484E4441);	// "HNDA"
 	} else if ((!dsiFeatures() || bs().b4dsMode) && ms().secondaryDevice) {
-		int err = runNdsFile(dlplayPath, 0, NULL, sys().isRunFromSD(), true, true, true, false, false, false, ms().gameLanguage);
+		int err = runNdsFile(bootPath, 0, NULL, sys().isRunFromSD(), true, true, true, false, false, false, ms().gameLanguage, 0);
 		char text[32];
 		snprintf(text, sizeof(text), STR_START_FAILED_ERROR.c_str(), err);
 		fadeType = true;
@@ -969,20 +1081,21 @@ void launchDownloadPlay(const vector<DirEntry>& dirContents) {
 		}
 		std::vector<char*> argarray;
 		argarray.push_back((char*)(sys().isRunFromSD() ? "sd:/_nds/TWiLightMenu/dsimenu.srldr" : "fat:/_nds/TWiLightMenu/dsimenu.srldr"));
-		runNdsFile(argarray[0], argarray.size(), (const char**)&argarray[0], sys().isRunFromSD(), true, false, false, true, true, false, -1);
+		runNdsFile(argarray[0], argarray.size(), (const char**)&argarray[0], sys().isRunFromSD(), true, false, false, true, true, false, -1, sys().commonCache());
 	} else {
 		char ndsToBoot[256];
 		sprintf(ndsToBoot, "%s:/_nds/nds-bootstrap-%s.nds", sys().isRunFromSD() ? "sd" : "fat", ms().bootstrapFile ? "nightly" : "release");
 		if (access(ndsToBoot, F_OK) != 0) {
 			sprintf(ndsToBoot, "%s:/_nds/nds-bootstrap-%s.nds", sys().isRunFromSD() ? "fat" : "sd", ms().bootstrapFile ? "nightly" : "release");
 		}
+		writeSoftResetId();
 
 		std::vector<char*> argarray;
 		argarray.push_back(ndsToBoot);
 
 		const char *bootstrapinipath = (sys().isRunFromSD() ? BOOTSTRAP_INI : BOOTSTRAP_INI_FC);
 		CIniFile bootstrapini(bootstrapinipath);
-		bootstrapini.SetString("NDS-BOOTSTRAP", "NDS_PATH", dlplayPath);
+		bootstrapini.SetString("NDS-BOOTSTRAP", "NDS_PATH", bootPath);
 		bootstrapini.SetString("NDS-BOOTSTRAP", "SAV_PATH", "");
 		bootstrapini.SetString("NDS-BOOTSTRAP", "HOMEBREW_ARG", "");
 		bootstrapini.SetString("NDS-BOOTSTRAP", "RAM_DRIVE_PATH", "");
@@ -1005,7 +1118,7 @@ void launchDownloadPlay(const vector<DirEntry>& dirContents) {
 		bootstrapini.SetInt("NDS-BOOTSTRAP", "REMAPPED_KEY_X", 10);
 		bootstrapini.SetInt("NDS-BOOTSTRAP", "REMAPPED_KEY_Y", 11);
 		bootstrapini.SaveIniFile(bootstrapinipath);
-		int err = runNdsFile(argarray[0], argarray.size(), (const char **)&argarray[0], sys().isRunFromSD(), true, true, false, true, true, false, -1);
+		int err = runNdsFile(argarray[0], argarray.size(), (const char **)&argarray[0], sys().isRunFromSD(), true, true, false, true, true, false, -1, 0);
 		char text[32];
 		snprintf(text, sizeof(text), STR_START_FAILED_ERROR.c_str(), err);
 		printLarge(false, 4, 4, text);
@@ -1033,7 +1146,7 @@ void launchDownloadPlay(const vector<DirEntry>& dirContents) {
 			argarray.erase(argarray.begin());
 		// }
 		argarray.push_back((char*)(sys().isRunFromSD() ? "sd:/_nds/TWiLightMenu/dsimenu.srldr" : "fat:/_nds/TWiLightMenu/dsimenu.srldr"));
-		runNdsFile(argarray[0], argarray.size(), (const char**)&argarray[0], sys().isRunFromSD(), true, false, false, true, true, false, -1);
+		runNdsFile(argarray[0], argarray.size(), (const char**)&argarray[0], sys().isRunFromSD(), true, false, false, true, true, false, -1, sys().commonCache());
 	}
 	stop();
 }
@@ -1248,6 +1361,7 @@ void launchInternetBrowser(const vector<DirEntry>& dirContents) {
 		if (access(ndsToBoot, F_OK) != 0) {
 			sprintf(ndsToBoot, "%s:/_nds/nds-bootstrap-%s.nds", sys().isRunFromSD() ? "fat" : "sd", ms().bootstrapFile ? "nightly" : "release");
 		}
+		writeSoftResetId();
 
 		std::vector<char*> argarray;
 		argarray.push_back(ndsToBoot);
@@ -1296,7 +1410,7 @@ void launchInternetBrowser(const vector<DirEntry>& dirContents) {
 
 		while (!screenFadedOut()) { swiWaitForVBlank(); }
 
-		int err = runNdsFile(argarray[0], argarray.size(), (const char **)&argarray[0], sys().isRunFromSD(), true, true, false, true, true, false, -1);
+		int err = runNdsFile(argarray[0], argarray.size(), (const char **)&argarray[0], sys().isRunFromSD(), true, true, false, true, true, false, -1, 0);
 		char text[32];
 		snprintf(text, sizeof(text), STR_START_FAILED_ERROR.c_str(), err);
 		printLarge(false, 4, 4, text);
@@ -1324,7 +1438,7 @@ void launchInternetBrowser(const vector<DirEntry>& dirContents) {
 			argarray.erase(argarray.begin());
 		// }
 		argarray.push_back((char*)(sys().isRunFromSD() ? "sd:/_nds/TWiLightMenu/dsimenu.srldr" : "fat:/_nds/TWiLightMenu/dsimenu.srldr"));
-		runNdsFile(argarray[0], argarray.size(), (const char**)&argarray[0], sys().isRunFromSD(), true, false, false, true, true, false, -1);
+		runNdsFile(argarray[0], argarray.size(), (const char**)&argarray[0], sys().isRunFromSD(), true, false, false, true, true, false, -1, sys().commonCache());
 	}
 	stop();
 }
@@ -1342,7 +1456,7 @@ void launchManual(void) {
 	ms().saveSettings();
 	// Launch manual
 	argarray.push_back((char*)(sys().isRunFromSD() ? "sd:/_nds/TWiLightMenu/manual.srldr" : "fat:/_nds/TWiLightMenu/manual.srldr"));
-	int err = runNdsFile(argarray[0], argarray.size(), (const char**)&argarray[0], sys().isRunFromSD(), true, false, false, true, true, false, -1);
+	int err = runNdsFile(argarray[0], argarray.size(), (const char**)&argarray[0], sys().isRunFromSD(), true, false, false, true, true, false, -1, sys().commonCache());
 	char text[32];
 	snprintf(text, sizeof(text), STR_START_FAILED_ERROR.c_str(), err);
 	fadeType = true;
@@ -1388,11 +1502,11 @@ void switchDevice(void) {
 			}
 		}
 		ms().secondaryDevice = !ms().secondaryDevice;
-		if (!rocketVideo_playVideo || ms().showBoxArt)
+		if (!rocketVideo_topVisible || ms().showBoxArt)
 			clearBoxArt(); // Clear box art
 		if (ms().theme != TWLSettings::EThemeSaturn && ms().theme != TWLSettings::EThemeHBL) whiteScreen = true;
 		boxArtLoaded = false;
-		rocketVideo_playVideo = true;
+		resumeRotatingCubesVideo();
 		shouldersRendered = false;
 		currentBg = 0;
 		showSTARTborder = false;
@@ -1434,7 +1548,7 @@ void switchDevice(void) {
 		if (directMethod) {
 			SetWidescreen(NULL);
 			chdir(sys().isRunFromSD() ? "sd:/" : "fat:/");
-			int err = runNdsFile("/_nds/TWiLightMenu/slot1launch.srldr", 0, NULL, sys().isRunFromSD(), true, true, false, true, true, false, -1);
+			int err = runNdsFile("/_nds/TWiLightMenu/slot1launch.srldr", 0, NULL, sys().isRunFromSD(), true, true, false, true, true, false, -1, 0);
 			char text[32];
 			snprintf(text, sizeof(text), STR_START_FAILED_ERROR.c_str(), err);
 			fadeType = true;
@@ -1448,7 +1562,8 @@ void launchGba(void) {
 	extern void s2RamAccessAlt(bool open);
 
 	if (ms().theme == TWLSettings::ETheme3DS && rocketVideo_playVideo) {
-		while (dmaBusy(1)); // Wait for frame to finish rendering
+		// The frame being blitted may live in the Slot-2 RAM pak we are about to take away
+		while (dmaBusy(0) || dmaBusy(1)); // Wait for frame to finish rendering
 	}
 	s2RamAccessAlt(false);
 	const bool validRom = (((u8*)GBAROM)[0xB2] == 0x96);
@@ -1481,7 +1596,7 @@ void launchGba(void) {
 				gbar2Path = ms().consoleModel>0 ? "fat:/_nds/GBARunner2_arm7dldi_3ds.nds" : "fat:/_nds/GBARunner2_arm7dldi_dsi.nds";
 			}
 			if (perGameSettings_useBootstrap == -1 ? ms().useBootstrap : perGameSettings_useBootstrap) {
-				int err = runNdsFile(gbar2Path, 0, NULL, sys().isRunFromSD(), true, true, false, true, false, -1);
+				int err = runNdsFile(gbar2Path, 0, NULL, sys().isRunFromSD(), true, true, false, true, false, -1, 0);
 				iprintf("Start failed. Error %i\n", err);
 			} else {
 				loadGameOnFlashcard(gbar2Path, false);
@@ -1512,7 +1627,7 @@ void launchGba(void) {
 				extern void ntrStartSdGame();
 				ntrStartSdGame();
 			}
-			int err = runNdsFile(argarray[0], argarray.size(), (const char **)&argarray[0], sys().isRunFromSD(), false, true, false, true, true, -1);
+			int err = runNdsFile(argarray[0], argarray.size(), (const char **)&argarray[0], sys().isRunFromSD(), false, true, false, true, true, -1, 0);
 			char text[32];
 			snprintf(text, sizeof(text), STR_START_FAILED_ERROR.c_str(), err);
 			fadeType = true;
@@ -1553,7 +1668,9 @@ void mdRomTooBig(void) {
 	} else {
 		while (!dboxStopped) { bgOperations(true); }
 	}
-	printSmall(false, 0, 64, STR_MD_ROM_TOO_BIG, Alignment::center, FontPalette::dialog);
+	char text[128];
+	snprintf(text, sizeof(text), STR_MD_ROM_TOO_BIG.c_str(), ms().secondaryDevice ? 3 : 4);
+	printSmall(false, 0, 64, text, Alignment::center, FontPalette::dialog);
 	printSmall(false, 0, 160, STR_A_OK, Alignment::center, FontPalette::dialog);
 	updateText(false);
 	int pressed = 0;
@@ -2453,7 +2570,7 @@ bool dsiWareCompatibleB4DS(void) {
 	return res;
 }
 
-bool cannotLaunchMsg(const char *filename) {
+bool cannotLaunchMsg(const char *filename, bool gbaBiosMissing = false) {
 	bool res = false;
 
 	clearText();
@@ -2470,9 +2587,11 @@ bool cannotLaunchMsg(const char *filename) {
 		str = (ms().secondaryDevice || ms().showMicroSd) ? &STR_CANNOT_LAUNCH_CORRUPT_TITLE_MICRO_SD : &STR_CANNOT_LAUNCH_CORRUPT_TITLE_SD;
 	} else if (isTwlm[CURPOS]) {
 		str = &STR_TWLMENU_ALREADY_RUNNING;
+	} else if (isNdz[CURPOS]) {
+		str = &STR_NDZ_ONLY_FOR_DSPICO_IR;
 	} else if (isUnlaunch[CURPOS]) {
 		str = &STR_CANNOT_LAUNCH_WITH_UI;
-	} else if (bnrRomType[CURPOS] == 1) {
+	} else if (gbaBiosMissing) {
 		str = &STR_GBA_BIOS_ERROR_DESC;
 	} else if (bnrRomType[CURPOS] != 0) {
 		str = ms().consoleModel >= 2 ? &STR_RELAUNCH_3DS_HOME : &STR_RELAUNCH_UNLAUNCH;
@@ -2500,7 +2619,7 @@ bool cannotLaunchMsg(const char *filename) {
 		if (pressed & KEY_A) {
 			break;
 		}
-		if ((pressed & KEY_Y) && bnrRomType[CURPOS] == 0 && !isDSiWare[CURPOS] && gameTid[CURPOS][0] == 'D') {
+		if ((pressed & KEY_Y) && bnrRomType[CURPOS] == 0 && !isNdz[CURPOS] && !isDSiWare[CURPOS] && gameTid[CURPOS][0] == 'D') {
 			// Hidden button to launch anyways
 			res = true;
 			break;
@@ -2538,10 +2657,10 @@ bool selectMenu(void) {
 	}
 	clearText();
 	updateText(false);
-	if (!rocketVideo_playVideo || ms().showBoxArt)
+	if (!rocketVideo_topVisible || ms().showBoxArt)
 		clearBoxArt(); // Clear box art
 	boxArtLoaded = false;
-	rocketVideo_playVideo = true;
+	resumeRotatingCubesVideo();
 	int maxCursors = 0;
 	int selCursorPosition = 0;
 	int assignedOp[5] = {-1};
@@ -2741,79 +2860,38 @@ void getFileInfo(SwitchState scrn, vector<vector<DirEntry>> dirContents, bool re
 			if (isDirectory[i]) {
 				bnrWirelessIcon[i] = 0;
 			} else {
-				if (extension(std_romsel_filename, {".nds", ".dsi", ".ids", ".srl", ".app", ".argv"})) {
-					bnrRomType[i] = 0;
-				} else if (extension(std_romsel_filename, {".xex", ".atr", ".a26", ".a52", ".a78"})) {
-					bnrRomType[i] = 10;
-				} else if (extension(std_romsel_filename, {".msx"})) {
-					bnrRomType[i] = 21;
-				} else if (extension(std_romsel_filename, {".col"})) {
-					bnrRomType[i] = 13;
-				} else if (extension(std_romsel_filename, {".m5"})) {
-					bnrRomType[i] = 14;
-				} else if (extension(std_romsel_filename, {".int"})) {
-					bnrRomType[i] = 12;
-				} else if (extension(std_romsel_filename, {".plg"})) {
-					bnrRomType[i] = 9;
-				} else if (extension(std_romsel_filename, {".avi", ".rvid", ".fv"})) {
-					bnrRomType[i] = 19;
-				} else if (extension(std_romsel_filename, {".gif", ".bmp", ".png"})) {
-					bnrRomType[i] = 20;
-				} else if (extension(std_romsel_filename, {".agb", ".gba", ".mb"})) {
-					bnrRomType[i] = 1;
-				} else if (extension(std_romsel_filename, {".gb", ".sgb"})) {
-					bnrRomType[i] = 2;
-				} else if (extension(std_romsel_filename, {".gbc"})) {
-					bnrRomType[i] = 3;
-				} else if (extension(std_romsel_filename, {".nes"})) {
-					bnrRomType[i] = 4;
-				} else if (extension(std_romsel_filename, {".fds"})) {
-					bnrRomType[i] = 4;
-				} else if (extension(std_romsel_filename, {".sg", ".sc"})) {
-					bnrRomType[i] = 15;
-				} else if (extension(std_romsel_filename, {".sms"})) {
-					bnrRomType[i] = 5;
-				} else if (extension(std_romsel_filename, {".gg"})) {
-					bnrRomType[i] = 6;
-				} else if (extension(std_romsel_filename, {".gen", ".md"})) {
-					bnrRomType[i] = 7;
-				} else if (extension(std_romsel_filename, {".smc"})) {
-					bnrRomType[i] = 8;
-				} else if (extension(std_romsel_filename, {".sfc"})) {
-					bnrRomType[i] = 8;
-				} else if (extension(std_romsel_filename, {".pce"})) {
-					bnrRomType[i] = 11;
-				} else if (extension(std_romsel_filename, {".ws", ".wsc"})) {
-					bnrRomType[i] = 16;
-				} else if (extension(std_romsel_filename, {".ngp", ".ngc"})) {
-					bnrRomType[i] = 17;
-				} else if (extension(std_romsel_filename, {".dsk"})) {
-					bnrRomType[i] = 18;
-				} else if (extension(std_romsel_filename, {".min"})) {
-					bnrRomType[i] = 22;
-				} else if (extension(std_romsel_filename, {".ntrb"})) {
-					bnrRomType[i] = 23;
-				} else {
-					bnrRomType[i] = 9;
-				}
+				bnrRomType[i] = launcherRomType(std_romsel_filename);
 
 				if (bnrRomType[i] != 0) {
 					bnrWirelessIcon[i] = 0;
 					bnrSysSettings[i] = false;
 					isValid[i] = true;
 					isTwlm[i] = false;
+					isNdz[i] = false;
 					isDSiWare[i] = false;
 					isHomebrew[i] = 0;
 				}
 
-				if (dsiFeatures() && !ms().macroMode && ms().showBoxArt == 2 && ms().theme != TWLSettings::EThemeHBL && !isDirectory[i]) {
-					snprintf(boxArtPath, sizeof(boxArtPath), "%s:/_nds/TWiLightMenu/boxart/%s.png",
+				if (dsiFeatures() && !ms().macroMode && ms().showBoxArt == 2 && ms().theme != TWLSettings::EThemeHBL) {
+					snprintf(boxArtPath, sizeof(boxArtPath), "%s:/_nds/TWiLightMenu/boxart/%s.bmp",
 							 sys().isRunFromSD() ? "sd" : "fat",
 							 dirContents[scrn][i + PAGENUM * 40].name.c_str());
-					if ((bnrRomType[i] == 0) && (access(boxArtPath, F_OK) != 0)) {
+					if (access(boxArtPath, F_OK) != 0) {
 						snprintf(boxArtPath, sizeof(boxArtPath), "%s:/_nds/TWiLightMenu/boxart/%s.png",
-								 (sys().isRunFromSD() ? "sd" : "fat"),
-								 gameTid[i]);
+								 sys().isRunFromSD() ? "sd" : "fat",
+								 dirContents[scrn][i + PAGENUM * 40].name.c_str());
+					}
+					if (!isDirectory[i] && (bnrRomType[i] == 0) && (access(boxArtPath, F_OK) != 0)) {
+						if (access(boxArtPath, F_OK) != 0) {
+							snprintf(boxArtPath, sizeof(boxArtPath), "%s:/_nds/TWiLightMenu/boxart/%s.bmp",
+									 (sys().isRunFromSD() ? "sd" : "fat"),
+									 gameTid[i]);
+						}
+						if (access(boxArtPath, F_OK) != 0) {
+							snprintf(boxArtPath, sizeof(boxArtPath), "%s:/_nds/TWiLightMenu/boxart/%s.png",
+									 (sys().isRunFromSD() ? "sd" : "fat"),
+									 gameTid[i]);
+						}
 					}
 					tex().loadBoxArtToMem(boxArtPath, i);
 				}
@@ -2832,33 +2910,210 @@ void getFileInfo(SwitchState scrn, vector<vector<DirEntry>> dirContents, bool re
 		progressBarLength = 0;
 		if (ms().theme != TWLSettings::EThemeSaturn && ms().theme != TWLSettings::EThemeHBL) fadeType = false; // Fade to white
 	}
-	// Load correct icons depending on cursor position
-	if (CURPOS <= 1) {
-		for (int i = 0; i < 5; i++) {
-			if (i + PAGENUM * 40 < file_count) {
-				bgOperations(true);
-				iconUpdate(dirContents[scrn].at(i + PAGENUM * 40).isDirectory,
-					   dirContents[scrn].at(i + PAGENUM * 40).name.c_str(), i);
-			}
-		}
-	} else if (CURPOS >= 2 && CURPOS <= 36) {
-		for (int i = 0; i < 6; i++) {
-			if ((CURPOS - 2 + i) + PAGENUM * 40 < file_count) {
-				bgOperations(true);
-				iconUpdate(dirContents[scrn].at((CURPOS - 2 + i) + PAGENUM * 40).isDirectory,
-					   dirContents[scrn].at((CURPOS - 2 + i) + PAGENUM * 40).name.c_str(),
-					   CURPOS - 2 + i);
-			}
-		}
-	} else if (CURPOS >= 37 && CURPOS <= 39) {
-		for (int i = 0; i < 5; i++) {
-			if ((35 + i) + PAGENUM * 40 < file_count) {
-				bgOperations(true);
-				iconUpdate(dirContents[scrn].at((35 + i) + PAGENUM * 40).isDirectory,
-					   dirContents[scrn].at((35 + i) + PAGENUM * 40).name.c_str(), 35 + i);
-			}
-		}
+	refreshGridIcons(scrn, dirContents, CURPOS, true);
+}
+
+// ---- Move mode: the keypad gesture (KEY_UP) and the stylus drag share all of this ----
+
+// Mirrors the move-mode row layout in graphics.cpp (the movingApp != -1 branch)
+// and the carried box drawn just below it. Keep the two in step.
+static constexpr int MOVE_SPACING = 76;	// titleboxXspacing while an app is carried
+static constexpr int MOVE_BOX_W = 64;	// every box/folder/settings sprite is this wide
+static constexpr int MOVE_HELD_X = 96;	// carried box x when it sits on the gap it left
+static constexpr int MOVE_GAP_CENTRE = MOVE_HELD_X + MOVE_BOX_W / 2;
+
+// Stylus drag tuning.
+static constexpr int MOVE_HOLD_FRAMES = 15;	// ~0.25s of holding still to pick an app up
+static constexpr int MOVE_HOLD_SLOP = 8;	// px of y wander tolerated while holding
+static constexpr int MOVE_SCROLL_DELAY = 4;	// frames between edge auto-scroll steps
+static constexpr int MOVE_EDGE_PX = 24;		// hard edge zone that can flip the page
+static constexpr int MOVE_PAGE_DWELL = 45;	// frames pinned at an edge before it flips
+
+struct MoveModeState {
+	int orgPage;
+	int orgCursorPosition;
+	DirEntry entry;	// copy of the carried entry, to re-find it after a page flip
+};
+
+// Inverse of the move-mode row layout: display slot p is drawn at
+// 96 + 38 + p * titleboxXspacing - titleboxXpos, so the gap in front of it -- the
+// hole the carried box drops into -- is centred at
+// MOVE_GAP_CENTRE + p * titleboxXspacing - titleboxXpos. Solve for p and round.
+//
+// There is no DSi +/-7 "fan" term because graphics.cpp only applies the fan in the
+// movingApp == -1 branch, so this is exact for both the DSi and 3DS themes.
+static int insertSlotAtScreenX(int centreX) {
+	const int num = centreX - MOVE_GAP_CENTRE + titleboxXpos[ms().secondaryDevice];
+	const int den = titleboxXspacing;	// MOVE_SPACING while carrying; read live
+	// Written out because num is legitimately negative left of the gap and integer
+	// division truncates towards zero.
+	return (num >= 0) ? (num + den / 2) / den : -((-num + den / 2) / den);
+}
+
+// ".." stays at index 0 of page 0; nothing may be dropped in front of it.
+static int minInsertSlot() {
+	return (PAGENUM == 0 && backFound) ? 1 : 0;
+}
+
+// The last slot holding a real entry -- the same clamp the keypad gesture passes to
+// moveCursor() as maxEntry.
+static int maxInsertSlot(const std::vector<DirEntry> &entries) {
+	return std::min(last_used_box, (int)entries.size() - 1 - PAGENUM * 40);
+}
+
+// Lift the app under the cursor out of the row. followStylus slides it across to the
+// stylus as it rises, so a dragged app ends up under the pen rather than on the gap.
+static MoveModeState beginMoveMode(SwitchState scrn, const std::vector<std::vector<DirEntry>> &dirContents,
+					bool followStylus, int stylusPx) {
+	bannerTextShown = false; // Redraw the title when done
+	showSTARTborder = false;
+	currentBg = 2;
+	clearText();
+	updateText(false);
+	mkdir(sys().isRunFromSD() ? "sd:/_nds/TWiLightMenu/extras" : "fat:/_nds/TWiLightMenu/extras", 0777);
+	movingApp = (PAGENUM * 40) + (CURPOS);
+	titleboxXspacing = MOVE_SPACING;
+	titleboxXdest[ms().secondaryDevice] = titleboxXpos[ms().secondaryDevice] = CURPOS * titleboxXspacing;
+
+	movingAppIsDir = dirContents[scrn][movingApp].isDirectory;
+
+	getGameInfo(dirContents[scrn][movingApp].isDirectory,
+				dirContents[scrn][movingApp].name.c_str(), -1);
+	iconUpdate(dirContents[scrn][movingApp].isDirectory,
+			   dirContents[scrn][movingApp].name.c_str(), -1);
+
+	const int movingAppYmax = ms().theme == TWLSettings::ETheme3DS ? 64 : 82;
+	const int movingAppXmax = followStylus
+					? std::clamp(stylusPx - MOVE_BOX_W / 2, -MOVE_BOX_W / 2, SCREEN_WIDTH - MOVE_BOX_W / 2)
+					: MOVE_HELD_X;
+	movingAppXpos = MOVE_HELD_X;
+	while (movingAppYpos < movingAppYmax) {
+		movingAppYpos += std::max((movingAppYmax - movingAppYpos) / 3, 1);
+		// Interpolated off the rise rather than eased separately, so both axes land
+		// on the same frame however the Y ramp is tuned.
+		movingAppXpos = MOVE_HELD_X + (movingAppXmax - MOVE_HELD_X) * movingAppYpos / movingAppYmax;
+		bgOperations(true);
 	}
+	movingAppXpos = movingAppXmax;
+
+	showMovingArrow = true;
+
+	return {PAGENUM, CURPOS, dirContents[scrn][movingApp]};
+}
+
+// Flip a page while still carrying an app. landAtEnd puts the cursor on the last
+// entry of the page instead of the first, which is what dragging off the left edge
+// wants. Returns false (with the "wrong" sound) if there is no page that way.
+static bool moveModePageFlip(bool forward, bool landAtEnd, SwitchState scrn,
+				std::vector<std::vector<DirEntry>> &dirContents,
+				const std::vector<std::string_view> &extensionList,
+				const MoveModeState &mv) {
+	if (forward ? !(file_count > 40 + PAGENUM * 40) : !(PAGENUM > 0)) {
+		snd().playWrong();
+		return false;
+	}
+
+	snd().playSwitch(forward ? 200 : 55);
+	fadeType = false; // Fade to white
+	for (int i = 0; i < 6; i++) {
+		bgOperations(true);
+	}
+	PAGENUM += forward ? 1 : -1;
+	CURPOS = 0;
+	titleboxXdest[ms().secondaryDevice] = 0;
+	titlewindowXdest[ms().secondaryDevice] = 0;
+	titleboxXpos[ms().secondaryDevice] = titleboxXdest[ms().secondaryDevice];
+	titlewindowXpos[ms().secondaryDevice] = titlewindowXdest[ms().secondaryDevice];
+	whiteScreen = true;
+	shouldersRendered = false;
+	displayNowLoading();
+	getDirectoryContents(dirContents[scrn], extensionList);
+
+	// movingApp is an absolute index into a vector getDirectoryContents has just
+	// rebuilt. It normally comes back identical -- nothing is written to [ORDER]
+	// until the drop -- but an SD card change or a dirInfo.twlm.ini appearing
+	// mid-carry could shift or remove the entry, and reordering the wrong file
+	// would be worse than abandoning the move.
+	if (movingApp >= (int)dirContents[scrn].size()
+			|| dirContents[scrn][movingApp].name != mv.entry.name) {
+		const auto it = std::find_if(dirContents[scrn].begin(), dirContents[scrn].end(),
+			[&](const DirEntry &e) { return e.name == mv.entry.name; });
+		movingApp = (it == dirContents[scrn].end()) ? -1 : (int)(it - dirContents[scrn].begin());
+	}
+
+	// Needs last_used_box, which getDirectoryContents has just recalculated, and has
+	// to happen before getFileInfo so that loads the icons around the right slot.
+	if (landAtEnd) {
+		CURPOS = std::max(maxInsertSlot(dirContents[scrn]), 0);
+		titleboxXdest[ms().secondaryDevice] = titleboxXpos[ms().secondaryDevice] = CURPOS * titleboxXspacing;
+		titlewindowXdest[ms().secondaryDevice] = titlewindowXpos[ms().secondaryDevice] = CURPOS * 5;
+	}
+
+	getFileInfo(scrn, dirContents, true);
+
+	while (!screenFadedOut()) {
+		bgOperations(true);
+	}
+	nowLoadingDisplaying = false;
+	whiteScreen = false;
+	displayGameIcons = true;
+	fadeType = true; // Fade in from white
+	for (int i = 0; i < 5; i++) {
+		bgOperations(true);
+	}
+	if (!vramSafeToUnmap()) swiWaitForVBlank(); // unmaps VRAM E/F/G while it copies
+	reloadIconPalettes();
+	clearText();
+	updateText(false);
+	return true;
+}
+
+// Drop the carried app into the gap and write the new order out. Does nothing but
+// settle the box if it landed back where it started, or if the entry went missing
+// across a page flip.
+static void endMoveMode(SwitchState scrn, std::vector<std::vector<DirEntry>> &dirContents,
+			const MoveModeState &mv) {
+	showMovingArrow = false;
+
+	const int dropFromX = movingAppXpos;
+	const int dropFromY = std::max(movingAppYpos, 1);
+	while (movingAppYpos > 0) {
+		movingAppYpos -= std::max(movingAppYpos / 3, 1);
+		// Slide back onto the gap as it falls, so a stylus drop does not snap sideways.
+		movingAppXpos = MOVE_HELD_X + (dropFromX - MOVE_HELD_X) * movingAppYpos / dropFromY;
+		bgOperations(true);
+	}
+	movingAppXpos = MOVE_HELD_X;
+
+	if (movingApp != -1 && ((PAGENUM != mv.orgPage) || (CURPOS != mv.orgCursorPosition))) {
+		currentBg = 1;
+		writeBannerText(STR_PLEASE_WAIT, STR_PLEASE_WAIT);
+		updateText(false);
+
+		int dest = CURPOS + (PAGENUM * 40);
+
+		DirEntry entry = dirContents[scrn][movingApp];
+		dirContents[scrn].erase(dirContents[scrn].begin() + movingApp);
+		dirContents[scrn].insert(dirContents[scrn].begin() + dest, entry);
+
+		std::vector<std::string> dirNames(dirContents[scrn].size());
+		for (uint i = 0; i < dirContents[scrn].size(); i++) {
+			dirNames[i] = dirContents[scrn][i].name;
+		}
+
+		CIniFile gameOrderIni(gameOrderIniPath);
+		getcwd(path, PATH_MAX);
+		gameOrderIni.SetStringVector("ORDER", path, dirNames, ':');
+		gameOrderIni.SaveIniFile(gameOrderIniPath);
+
+		// Every per-slot cache (titles, banners, box art) is indexed by grid slot, so
+		// the whole page has to be re-read once the entries have shifted.
+		getFileInfo(scrn, dirContents, false);
+	}
+
+	movingApp = -1;
+	titleboxXspacing = 58;
+	titleboxXdest[ms().secondaryDevice] = titleboxXpos[ms().secondaryDevice] = CURPOS * titleboxXspacing;
 }
 
 static bool previousPage(SwitchState scrn, vector<vector<DirEntry>> dirContents) {
@@ -2886,7 +3141,7 @@ static bool previousPage(SwitchState scrn, vector<vector<DirEntry>> dirContents)
 		clearBoxArt(); // Clear box art
 	boxArtLoaded = false;
 	bannerTextShown = false;
-	rocketVideo_playVideo = true;
+	resumeRotatingCubesVideo();
 	shouldersRendered = false;
 	currentBg = 0;
 	showSTARTborder = false;
@@ -2898,33 +3153,7 @@ static bool previousPage(SwitchState scrn, vector<vector<DirEntry>> dirContents)
 	if (showLshoulder) {
 		displayNowLoading();
 	} else {
-		// Load correct icons depending on cursor position
-		if (CURPOS <= 1) {
-			for (int i = 0; i < 5; i++) {
-				if (i + PAGENUM * 40 < file_count) {
-					bgOperations(true);
-					iconUpdate(dirContents[scrn].at(i + PAGENUM * 40).isDirectory,
-						   dirContents[scrn].at(i + PAGENUM * 40).name.c_str(), i);
-				}
-			}
-		} else if (CURPOS >= 2 && CURPOS <= 36) {
-			for (int i = 0; i < 6; i++) {
-				if ((CURPOS - 2 + i) + PAGENUM * 40 < file_count) {
-					bgOperations(true);
-					iconUpdate(dirContents[scrn].at((CURPOS - 2 + i) + PAGENUM * 40).isDirectory,
-						   dirContents[scrn].at((CURPOS - 2 + i) + PAGENUM * 40).name.c_str(),
-						   CURPOS - 2 + i);
-				}
-			}
-		} else if (CURPOS >= 37 && CURPOS <= 39) {
-			for (int i = 0; i < 5; i++) {
-				if ((35 + i) + PAGENUM * 40 < file_count) {
-					bgOperations(true);
-					iconUpdate(dirContents[scrn].at((35 + i) + PAGENUM * 40).isDirectory,
-						   dirContents[scrn].at((35 + i) + PAGENUM * 40).name.c_str(), 35 + i);
-				}
-			}
-		}
+		refreshGridIcons(scrn, dirContents, CURPOS, true);
 		whiteScreen = false;
 		fadeType = true; // Fade in from white
 	}
@@ -2963,7 +3192,7 @@ static bool nextPage(SwitchState scrn, vector<vector<DirEntry>> dirContents) {
 		clearBoxArt(); // Clear box art
 	boxArtLoaded = false;
 	bannerTextShown = false;
-	rocketVideo_playVideo = true;
+	resumeRotatingCubesVideo();
 	shouldersRendered = false;
 	currentBg = 0;
 	showSTARTborder = false;
@@ -2975,33 +3204,7 @@ static bool nextPage(SwitchState scrn, vector<vector<DirEntry>> dirContents) {
 	if (showRshoulder) {
 		displayNowLoading();
 	} else {
-		// Load correct icons depending on cursor position
-		if (CURPOS <= 1) {
-			for (int i = 0; i < 5; i++) {
-				if (i + PAGENUM * 40 < file_count) {
-					bgOperations(true);
-					iconUpdate(dirContents[scrn].at(i + PAGENUM * 40).isDirectory,
-						   dirContents[scrn].at(i + PAGENUM * 40).name.c_str(), i);
-				}
-			}
-		} else if (CURPOS >= 2 && CURPOS <= 36) {
-			for (int i = 0; i < 6; i++) {
-				if ((CURPOS - 2 + i) + PAGENUM * 40 < file_count) {
-					bgOperations(true);
-					iconUpdate(dirContents[scrn].at((CURPOS - 2 + i) + PAGENUM * 40).isDirectory,
-						   dirContents[scrn].at((CURPOS - 2 + i) + PAGENUM * 40).name.c_str(),
-						   CURPOS - 2 + i);
-				}
-			}
-		} else if (CURPOS >= 37 && CURPOS <= 39) {
-			for (int i = 0; i < 5; i++) {
-				if ((35 + i) + PAGENUM * 40 < file_count) {
-					bgOperations(true);
-					iconUpdate(dirContents[scrn].at((35 + i) + PAGENUM * 40).isDirectory,
-						   dirContents[scrn].at((35 + i) + PAGENUM * 40).name.c_str(), 35 + i);
-				}
-			}
-		}
+		refreshGridIcons(scrn, dirContents, CURPOS, true);
 		whiteScreen = false;
 		fadeType = true; // Fade in from white
 	}
@@ -3164,7 +3367,8 @@ std::string browseForFile(const std::vector<std::string_view> extensionList) {
 	while (1) {
 		updateDirectoryContents(dirContents[scrn]);
 		getFileInfo(scrn, dirContents, true);
-		reloadIconPalettes();
+		if (!vramSafeToUnmap()) swiWaitForVBlank(); // unmaps VRAM E/F/G while it copies
+			reloadIconPalettes();
 		if (ms().theme != TWLSettings::EThemeSaturn && ms().theme != TWLSettings::EThemeHBL) {
 			while (!screenFadedOut()) { swiWaitForVBlank(); }
 		}
@@ -3202,7 +3406,9 @@ std::string browseForFile(const std::vector<std::string_view> extensionList) {
 			}
 
 			controlTopBright = true;
-			while (!screenFadedIn()) { swiWaitForVBlank(); }
+			// Give the vblank handler at least one frame to apply the top screen's brightness:
+			// if the bottom screen has already faded in, the loop would not wait at all
+			do { swiWaitForVBlank(); } while (!screenFadedIn());
 			musicplaying = true;
 		}
 
@@ -3248,10 +3454,6 @@ std::string browseForFile(const std::vector<std::string_view> extensionList) {
 				boxArtFound = ((CURPOS + PAGENUM * 40) < ((int)dirContents[scrn].size()));
 				if (boxArtFound) {
 					boxArtFilename = dirContents[scrn].at(CURPOS + PAGENUM * 40).name.c_str();
-
-					logPrint("boxArtFilename: ");
-					logPrint(boxArtFilename);
-					logPrint("\n");
 				}
 				updateBoxArt();
 				if (ms().theme < 4) {
@@ -3274,7 +3476,7 @@ std::string browseForFile(const std::vector<std::string_view> extensionList) {
 								dirContents[scrn].at(CURPOS + PAGENUM * 40).name, CURPOS);
 						bannerTextShown = true;
 					}
-					if ((infoCheckTimer < 30) && (bnrRomType[CURPOS] == 0) && (isHomebrew[CURPOS] == 0)) {
+					if ((infoCheckTimer < 30) && !isNdz[CURPOS] && (bnrRomType[CURPOS] == 0) && (isHomebrew[CURPOS] == 0)) {
 						if (!isDSiWare[CURPOS]) {
 							infoCheckTimer++;
 							if (infoCheckTimer == 30) {
@@ -3301,14 +3503,23 @@ std::string browseForFile(const std::vector<std::string_view> extensionList) {
 						}
 					}
 				} else {
-					if (displayBoxArt && !rocketVideo_playVideo) {
+					if (displayBoxArt && !rocketVideo_topVisible) {
 						clearBoxArt();
 						displayBoxArt = false;
 					}
 					bannerTextShown = false;
 					clearText(false);
 					currentBg = 0;
-					showSTARTborder = rocketVideo_playVideo = (ms().theme == TWLSettings::ETheme3DS ? true : false);
+					// This runs every frame while the cursor is on an empty spot: only ask for a
+					// repaint when playback actually changes, or the video would never advance
+					const bool playVideo = (ms().theme == TWLSettings::ETheme3DS);
+					showSTARTborder = playVideo;
+					if (rocketVideo_playVideo != playVideo || rocketVideo_topVisible != playVideo) {
+						const int oldIE = enterCriticalSection();
+						rocketVideo_playVideo = playVideo;
+						rocketVideo_topVisible = rocketVideo_weaveRefill = playVideo;
+						leaveCriticalSection(oldIE);
+					}
 				}
 				if (ms().theme == TWLSettings::EThemeHBL) {
 					printLarge(false, 0, 142, "^", Alignment::center, FontPalette::overlay);
@@ -3345,35 +3556,7 @@ std::string browseForFile(const std::vector<std::string_view> extensionList) {
 				dsiWareRAMLimitMsgPrepped = false;
 				infoCheckTimer = 0;
 			} else if ((pressed & KEY_UP) && (PAGENUM > 0 || CURPOS > 0 || !backFound) && (ms().theme != TWLSettings::EThemeSaturn && ms().theme != TWLSettings::EThemeHBL) && !dirInfoIniFound && (ms().sortMethod == 4) && (CURPOS + PAGENUM * 40 < ((int)dirContents[scrn].size()))) { // Move apps (DSi & 3DS themes)
-				bannerTextShown = false; // Redraw the title when done
-				showSTARTborder = false;
-				currentBg = 2;
-				clearText();
-				updateText(false);
-				mkdir(sys().isRunFromSD() ? "sd:/_nds/TWiLightMenu/extras" : "fat:/_nds/TWiLightMenu/extras", 0777);
-				movingApp = (PAGENUM * 40) + (CURPOS);
-				titleboxXspacing = 76;
-				titleboxXdest[ms().secondaryDevice] = titleboxXpos[ms().secondaryDevice] = CURPOS * titleboxXspacing;
-
-				if (dirContents[scrn][movingApp].isDirectory)
-					movingAppIsDir = true;
-				else
-					movingAppIsDir = false;
-
-				getGameInfo(dirContents[scrn][movingApp].isDirectory,
-							dirContents[scrn][movingApp].name.c_str(), -1);
-				iconUpdate(dirContents[scrn][movingApp].isDirectory,
-						   dirContents[scrn][movingApp].name.c_str(), -1);
-
-				int movingAppYmax = ms().theme == TWLSettings::ETheme3DS ? 64 : 82;
-				while (movingAppYpos < movingAppYmax) {
-					movingAppYpos += std::max((movingAppYmax - movingAppYpos) / 3, 1);
-					bgOperations(true);
-				}
-
-				int orgCursorPosition = CURPOS;
-				int orgPage = PAGENUM;
-				showMovingArrow = true;
+				MoveModeState mv = beginMoveMode(scrn, dirContents, /* followStylus = */ false, 0);
 
 				while (1) {
 					scanKeys();
@@ -3401,117 +3584,18 @@ std::string browseForFile(const std::vector<std::string_view> extensionList) {
 							edgeBumpSoundPlayed = true;
 						}
 					} else if (pressed & KEY_DOWN) {
-						showMovingArrow = false;
-						while (movingAppYpos > 0) {
-							movingAppYpos -= std::max(movingAppYpos / 3, 1);
-							bgOperations(true);
-						}
 						break;
 					} else if (pressed & KEY_L) {
-						if (PAGENUM > 0) {
-							snd().playSwitch(55);
-							fadeType = false; // Fade to white
-							for (int i = 0; i < 6; i++) {
-								bgOperations(true);
-							}
-							PAGENUM -= 1;
-							CURPOS = 0;
-							titleboxXdest[ms().secondaryDevice] = 0;
-							titlewindowXdest[ms().secondaryDevice] = 0;
-							titleboxXpos[ms().secondaryDevice] = titleboxXdest[ms().secondaryDevice];
-							titlewindowXpos[ms().secondaryDevice] = titlewindowXdest[ms().secondaryDevice];
-							whiteScreen = true;
-							shouldersRendered = false;
-							displayNowLoading();
-							getDirectoryContents(dirContents[scrn], extensionList);
-							getFileInfo(scrn, dirContents, true);
-
-							while (!screenFadedOut()) {
-								bgOperations(true);
-							}
-							nowLoadingDisplaying = false;
-							whiteScreen = false;
-							displayGameIcons = true;
-							fadeType = true; // Fade in from white
-							for (int i = 0; i < 5; i++) {
-								bgOperations(true);
-							}
-							reloadIconPalettes();
-							clearText();
-							updateText(false);
-						} else {
-							snd().playWrong();
-						}
+						moveModePageFlip(false, /* landAtEnd = */ false, scrn, dirContents, extensionList, mv);
 					} else if (pressed & KEY_R) {
-						if (file_count > 40 + PAGENUM * 40) {
-							snd().playSwitch(200);
-							fadeType = false; // Fade to white
-							for (int i = 0; i < 6; i++) {
-								bgOperations(true);
-							}
-							PAGENUM += 1;
-							CURPOS = 0;
-							titleboxXdest[ms().secondaryDevice] = 0;
-							titlewindowXdest[ms().secondaryDevice] = 0;
-							titleboxXpos[ms().secondaryDevice] = titleboxXdest[ms().secondaryDevice];
-							titlewindowXpos[ms().secondaryDevice] = titlewindowXdest[ms().secondaryDevice];
-							whiteScreen = true;
-							shouldersRendered = false;
-							displayNowLoading();
-							getDirectoryContents(dirContents[scrn], extensionList);
-							getFileInfo(scrn, dirContents, true);
-
-							while (!screenFadedOut()) {
-								bgOperations(true);
-							}
-							nowLoadingDisplaying = false;
-							whiteScreen = false;
-							displayGameIcons = true;
-							fadeType = true; // Fade in from white
-							for (int i = 0; i < 5; i++) {
-								bgOperations(true);
-							}
-							reloadIconPalettes();
-							clearText();
-							updateText(false);
-						} else {
-							snd().playWrong();
-						}
+						moveModePageFlip(true, /* landAtEnd = */ false, scrn, dirContents, extensionList, mv);
 					}
+
+					if (movingApp == -1) // The entry went missing across a page flip
+						break;
 				}
 
-				if ((PAGENUM != orgPage) || (CURPOS != orgCursorPosition)) {
-					currentBg = 1;
-					writeBannerText(STR_PLEASE_WAIT, STR_PLEASE_WAIT);
-					updateText(false);
-
-					int dest = CURPOS + (PAGENUM * 40);
-
-					DirEntry entry = dirContents[scrn][movingApp];
-					dirContents[scrn].erase(dirContents[scrn].begin() + movingApp);
-					dirContents[scrn].insert(dirContents[scrn].begin() + dest, entry);
-
-					std::vector<std::string> dirNames(dirContents[scrn].size());
-					for (uint i=0;i<dirContents[scrn].size();i++) {
-						dirNames[i] = dirContents[scrn][i].name;
-					}
-
-					CIniFile gameOrderIni(gameOrderIniPath);
-					getcwd(path, PATH_MAX);
-					gameOrderIni.SetStringVector("ORDER", path, dirNames, ':');
-					gameOrderIni.SaveIniFile(gameOrderIniPath);
-
-					if (ms().sortMethod != TWLSettings::ESortCustom) {
-						ms().sortMethod = TWLSettings::ESortCustom;
-						ms().saveSettings();
-					}
-
-					getFileInfo(scrn, dirContents, false);
-				}
-
-				movingApp = -1;
-				titleboxXspacing = 58;
-				titleboxXdest[ms().secondaryDevice] = titleboxXpos[ms().secondaryDevice] = CURPOS * titleboxXspacing;
+				endMoveMode(scrn, dirContents, mv);
 			} else if ((pressed & KEY_TOUCH) && touch.py > 171 && touch.px >= 19 && touch.px <= 236 && ms().theme == TWLSettings::EThemeDSi) { // Scroll bar (DSi theme)
 				touchPosition startTouch = touch;
 				showSTARTborder = false;
@@ -3547,14 +3631,7 @@ std::string browseForFile(const std::vector<std::string_view> extensionList) {
 
 					// Load icons
 					if (prevPos != CURPOS) {
-						for (int i = 0; i < 6; i++) {
-							const int pos = (CURPOS - 2 + i);
-							if (pos >= 0 && pos + PAGENUM * 40 < file_count) {
-								iconUpdate(dirContents[scrn][pos + PAGENUM * 40].isDirectory,
-										dirContents[scrn][pos + PAGENUM * 40].name.c_str(),
-										pos);
-							}
-						}
+						refreshGridIcons(scrn, dirContents, CURPOS, false);
 					}
 
 					if (CURPOS + PAGENUM * 40 < ((int)dirContents[scrn].size())) {
@@ -3594,7 +3671,19 @@ std::string browseForFile(const std::vector<std::string_view> extensionList) {
 				infoCheckTimer = 0;
 
 				bool tapped = false;
+				bool lifted = false;
 				bool dsiCursorMove = false;
+
+				// Same gate as the keypad move gesture, plus: only the box under the
+				// cursor can be picked up, and it has to be a real entry.
+				const bool canLift = !dirInfoIniFound
+						&& ms().sortMethod == TWLSettings::ESortCustom
+						&& ms().theme != TWLSettings::EThemeSaturn && ms().theme != TWLSettings::EThemeHBL
+						&& (PAGENUM > 0 || CURPOS > 0 || !backFound)
+						&& startTouch.px >= 96 && startTouch.px < 160 // the moveBy == 0 band below
+						&& CURPOS + PAGENUM * 40 < ((int)dirContents[scrn].size());
+
+				int holdFrames = 0;
 				while (1) {
 					scanKeys();
 					touchRead(&touch);
@@ -3609,10 +3698,89 @@ std::string browseForFile(const std::vector<std::string_view> extensionList) {
 					} else if (touch.px < startTouch.px - 2
 							|| touch.px > startTouch.px + 2) {
 						break;
+					} else if (canLift) {
+						// Holding still picks the app up. x is already pinned to +/-2 by
+						// the test above, so only y needs slop; wandering out of it resets
+						// the timer rather than cancelling, so settling after a wobble
+						// still lifts.
+						if (touch.py < startTouch.py - MOVE_HOLD_SLOP
+								|| touch.py > startTouch.py + MOVE_HOLD_SLOP) {
+							holdFrames = 0;
+						} else if (++holdFrames >= MOVE_HOLD_FRAMES) {
+							lifted = true;
+							break;
+						}
 					}
 				}
 
-				if (tapped) {
+				if (lifted) {
+					MoveModeState mv = beginMoveMode(scrn, dirContents, /* followStylus = */ true, startTouch.px);
+					const int dev = ms().secondaryDevice;
+					const int liftY = (ms().theme == TWLSettings::ETheme3DS) ? 64 : 82;
+					// Not startTouch: the shared tail below restores that into touch, and
+					// on the 3DS theme a py > 171 there reads as "launch the selection".
+					int grabY = startTouch.py;
+					int scrollDelay = 0;
+					int edgeDwell = 0;
+
+					while (1) {
+						scanKeys();
+						// Test the release before sampling: the digitizer's last reading
+						// before lift-off is often garbage, so the drop has to commit the
+						// CURPOS established by the previous good frame.
+						if (!(keysHeld() & KEY_TOUCH))
+							break;
+						touchRead(&touch);
+
+						movingAppXpos = std::clamp(touch.px - MOVE_BOX_W / 2, -MOVE_BOX_W / 2, SCREEN_WIDTH - MOVE_BOX_W / 2);
+						movingAppYpos = std::clamp(liftY - (touch.py - grabY), 0, titleboxYpos);
+
+						const int lo = minInsertSlot();
+						const int hi = maxInsertSlot(dirContents[scrn]);
+						// hi < lo only for a page with nothing movable on it, which canLift
+						// already excludes; guard anyway, since std::clamp would be UB.
+						const int want = (hi < lo) ? CURPOS : std::clamp(insertSlotAtScreenX(touch.px), lo, hi);
+
+						if (scrollDelay > 0)
+							scrollDelay--;
+						const bool settled = (titleboxXpos[dev] == titleboxXdest[dev]);
+
+						if (settled && scrollDelay == 0 && want != CURPOS) {
+							// The row slides under the stylus, so holding near an edge keeps
+							// re-evaluating to CURPOS +/- 1 -- this is also the edge auto-scroll.
+							moveHeldCursor(want > CURPOS, dirContents[scrn]);
+							scrollDelay = MOVE_SCROLL_DELAY;
+							edgeDwell = 0;
+						} else if (settled && want == CURPOS
+								&& (touch.px <= MOVE_EDGE_PX || touch.px >= SCREEN_WIDTH - MOVE_EDGE_PX)) {
+							// Pinned against the end of the page with the stylus held in the
+							// hard edge zone: flip. The dwell is long because a flip costs a
+							// fade, a directory re-read and 40 banner loads.
+							const bool forward = (touch.px >= SCREEN_WIDTH - MOVE_EDGE_PX);
+							const bool pinned = forward ? (CURPOS >= hi) : (CURPOS <= lo);
+							const bool canFlip = forward ? (file_count > 40 + PAGENUM * 40) : (PAGENUM > 0);
+							if (pinned && canFlip && ++edgeDwell >= MOVE_PAGE_DWELL) {
+								edgeDwell = 0;
+								moveModePageFlip(forward, /* landAtEnd = */ !forward, scrn, dirContents,
+										 extensionList, mv);
+								if (movingApp == -1) // The entry went missing across the flip
+									break;
+								scanKeys();
+								if (!(keysHeld() & KEY_TOUCH))
+									break;
+								touchRead(&touch);
+								grabY = touch.py; // Re-anchor the y grab across the load
+								scrollDelay = MOVE_SCROLL_DELAY;
+							}
+						} else {
+							edgeDwell = 0;
+						}
+
+						bgOperations(true);
+					}
+
+					endMoveMode(scrn, dirContents, mv);
+				} else if (tapped) {
 					int moveBy;
 					if (startTouch.px < 39)
 						moveBy = -2;
@@ -3652,15 +3820,7 @@ std::string browseForFile(const std::vector<std::string_view> extensionList) {
 								swiWaitForVBlank();
 							}
 
-							// Load icons
-							for (int i = 0; i < 6; i++) {
-								const int pos = (CURPOS1 - 2 + i);
-								if (pos >= 0 && pos + PAGENUM * 40 < file_count) {
-									iconUpdate(dirContents[scrn][pos + PAGENUM * 40].isDirectory,
-											dirContents[scrn][pos + PAGENUM * 40].name.c_str(),
-											pos);
-								}
-							}
+							refreshGridIcons(scrn, dirContents, CURPOS1, false);
 
 							for (int i = 0; i < 6; i++) {
 								swiWaitForVBlank();
@@ -3672,15 +3832,7 @@ std::string browseForFile(const std::vector<std::string_view> extensionList) {
 								swiWaitForVBlank();
 							}
 
-							// Load icons again
-							for (int i = 0; i < 6; i++) {
-								const int pos = (CURPOS - 2 + i);
-								if (pos >= 0 && pos + PAGENUM * 40 < file_count) {
-									iconUpdate(dirContents[scrn][pos + PAGENUM * 40].isDirectory,
-											dirContents[scrn][pos + PAGENUM * 40].name.c_str(),
-											pos);
-								}
-							}
+							refreshGridIcons(scrn, dirContents, CURPOS, false);
 
 							while (titleboxXpos[ms().secondaryDevice] != titleboxXdest[ms().secondaryDevice]) {
 								swiWaitForVBlank();
@@ -3692,15 +3844,7 @@ std::string browseForFile(const std::vector<std::string_view> extensionList) {
 					} else if (ms().theme != TWLSettings::EThemeSaturn) {
 						CURPOS = std::clamp(CURPOS + moveBy, 0, last_used_box);
 
-						// Load icons
-						for (int i = 0; i < 6; i++) {
-							const int pos = (CURPOS - 2 + i);
-							if (pos >= 0 && pos + PAGENUM * 40 < file_count) {
-								iconUpdate(dirContents[scrn][pos + PAGENUM * 40].isDirectory,
-										dirContents[scrn][pos + PAGENUM * 40].name.c_str(),
-										pos);
-							}
-						}
+						refreshGridIcons(scrn, dirContents, CURPOS, false);
 					}
 				} else if (ms().theme != TWLSettings::EThemeSaturn) {
 					draggingIcons = true;
@@ -3737,15 +3881,7 @@ std::string browseForFile(const std::vector<std::string_view> extensionList) {
 								CURPOS = std::clamp((titleboxXpos[ms().secondaryDevice] + 28) / titleboxXspacing, 0, last_used_box);
 
 								if (CURPOS != prevPos) {
-									// Load icons
-									for (int i = 0; i < 6; i++) {
-										int pos = (CURPOS - 2 + i);
-										if (pos >= 0 && pos + PAGENUM * 40 < file_count) {
-											iconUpdate(dirContents[scrn][pos + PAGENUM * 40].isDirectory,
-													dirContents[scrn][pos + PAGENUM * 40].name.c_str(),
-													pos);
-										}
-									}
+									refreshGridIcons(scrn, dirContents, CURPOS, false);
 
 									clearText();
 									if (CURPOS + PAGENUM * 40 < ((int)dirContents[scrn].size()) && boxDest > -28 && boxDest < titleboxXspacing * 39 + 28) {
@@ -3789,15 +3925,7 @@ std::string browseForFile(const std::vector<std::string_view> extensionList) {
 						CURPOS = std::clamp((titleboxXpos[ms().secondaryDevice] + 28) / titleboxXspacing, 0, last_used_box);
 
 						if (prevPos != CURPOS) {
-							// Load icons
-							for (int i = 0; i < 6; i++) {
-								int pos = (CURPOS - 2 + i);
-								if (pos >= 0 && pos + PAGENUM * 40 < file_count) {
-									iconUpdate(dirContents[scrn][pos + PAGENUM * 40].isDirectory,
-											dirContents[scrn][pos + PAGENUM * 40].name.c_str(),
-											pos);
-								}
-							}
+							refreshGridIcons(scrn, dirContents, CURPOS, false);
 						}
 
 						clearText();
@@ -3886,17 +4014,21 @@ std::string browseForFile(const std::vector<std::string_view> extensionList) {
 						loadPerGameSettings(dirContents[scrn].at(CURPOS + PAGENUM * 40).name);
 					}
 					bool proceedToLaunch = true;
-					if (!isValid[CURPOS] || isTwlm[CURPOS] || (isUnlaunch[CURPOS] && ms().theme == TWLSettings::ETheme3DS) || (!isDSiWare[CURPOS] && (!dsiFeatures() || bs().b4dsMode) && ms().secondaryDevice && bnrRomType[CURPOS] == 0 && gameTid[CURPOS][0] == 'D' && unitCode[CURPOS] == 3 && requiresDonorRom[CURPOS] != 51)
+					const std::string &launchName = dirContents[scrn].at(CURPOS + PAGENUM * 40).name;
+					const LaunchPrecheck precheck = launcherPrecheck(findCustomLauncher(launchName), captureLaunchEnv(ms().secondaryDevice), launchName);
+					const bool gbaBiosMissing = (precheck == LaunchPrecheck::GbaBios && checkForGbaBiosRequirement());
+					if (!isValid[CURPOS] || (isNdz[CURPOS] && (!ms().secondaryDevice || memcmp(io_dldi_data->friendlyName, "DSpico", 6) != 0)) || isTwlm[CURPOS] || (isUnlaunch[CURPOS] && ms().theme == TWLSettings::ETheme3DS)
+					|| (!isDSiWare[CURPOS] && (!dsiFeatures() || bs().b4dsMode) && ms().secondaryDevice && bnrRomType[CURPOS] == 0 && gameTid[CURPOS][0] == 'D' && unitCode[CURPOS] == 3 && requiresDonorRom[CURPOS] != 51)
 					|| (isDSiWare[CURPOS] && ((((!dsiFeatures() && (!sdFound() || !ms().dsiWareToSD)) || bs().b4dsMode) && ms().secondaryDevice && (checkedDSiWareCompatibleB4DS ? !savedDSiWareCompatibleB4DS : !dsiWareCompatibleB4DS()))
 					|| (isDSiMode() && memcmp(io_dldi_data->friendlyName, "CycloDS iEvolution", 18) != 0 && sys().arm7SCFGLocked() && !sys().dsiWramAccess() && !gameCompatibleMemoryPit())))
-					|| (bnrRomType[CURPOS] == 1 && (!ms().secondaryDevice || dsiFeatures() || ms().gbaBooter == TWLSettings::EGbaGbar2) && checkForGbaBiosRequirement())) {
+					|| gbaBiosMissing) {
 						if (isDSiWare[CURPOS] && ((!dsiFeatures() && (!sdFound() || !ms().dsiWareToSD)) || bs().b4dsMode) && ms().secondaryDevice) {
 							checkedDSiWareCompatibleB4DS = true;
 						}
-						proceedToLaunch = cannotLaunchMsg(dirContents[scrn].at(CURPOS + PAGENUM * 40).name.c_str());
+						proceedToLaunch = cannotLaunchMsg(launchName.c_str(), gbaBiosMissing);
 					}
 					const bool useBootstrapAnyway = ((perGameSettings_fcGameLoader == -1 ? (ms().fcGameLoader == TWLSettings::ENdsBootstrap) : (perGameSettings_fcGameLoader == TWLSettings::ENdsBootstrap)) || !ms().secondaryDevice);
-					if (proceedToLaunch && useBootstrapAnyway && bnrRomType[CURPOS] == 0 && !isDSiWare[CURPOS]
+					if (proceedToLaunch && useBootstrapAnyway && !isNdz[CURPOS] && bnrRomType[CURPOS] == 0 && !isDSiWare[CURPOS]
 					 && isHomebrew[CURPOS] == 0
 					 && checkIfDSiMode(dirContents[scrn].at(CURPOS + PAGENUM * 40).name)) {
 						if (!dsiBinariesChecked && dsiFeatures() && (!ms().secondaryDevice || !bs().b4dsMode)) {
@@ -3908,7 +4040,7 @@ std::string browseForFile(const std::vector<std::string_view> extensionList) {
 							proceedToLaunch = dsiBinariesMissingMsg(dirContents[scrn].at(CURPOS + PAGENUM * 40).name.c_str());
 						}
 					}
-					if (proceedToLaunch && (useBootstrapAnyway || ((!dsiFeatures() || bs().b4dsMode) && isDSiWare[CURPOS])) && bnrRomType[CURPOS] == 0 && !dsModeForced && isHomebrew[CURPOS] == 0) {
+					if (proceedToLaunch && (useBootstrapAnyway || ((!dsiFeatures() || bs().b4dsMode) && isDSiWare[CURPOS])) && !isNdz[CURPOS] && bnrRomType[CURPOS] == 0 && !dsModeForced && isHomebrew[CURPOS] == 0) {
 						proceedToLaunch = checkForCompatibleGame(dirContents[scrn].at(CURPOS + PAGENUM * 40).name.c_str());
 						if (proceedToLaunch && requiresDonorRom[CURPOS]) {
 							const char* pathDefine = "DONORTWL_NDS_PATH"; // SDK5.x (TWL)
@@ -3954,11 +4086,11 @@ std::string browseForFile(const std::vector<std::string_view> extensionList) {
 								proceedToLaunch = donorRomMsg(dirContents[scrn].at(CURPOS + PAGENUM * 40).name.c_str());
 							}
 						}
-						if (proceedToLaunch && !apChecked && !isDSiWare[CURPOS] && checkIfShowAPMsg(dirContents[scrn].at(CURPOS + PAGENUM * 40).name)) {
+						if (proceedToLaunch && !apChecked && !isNdz[CURPOS] && !isDSiWare[CURPOS] && checkIfShowAPMsg(dirContents[scrn].at(CURPOS + PAGENUM * 40).name)) {
 							hasAP = checkRomAP(dirContents[scrn].at(CURPOS + PAGENUM * 40).name.c_str(), CURPOS);
 							apChecked = true;
 						}
-						if (proceedToLaunch && isDSiWare[CURPOS] && (!dsiFeatures() || bs().b4dsMode) && ms().secondaryDevice) {
+						if (proceedToLaunch && !isNdz[CURPOS] && isDSiWare[CURPOS] && (!dsiFeatures() || bs().b4dsMode) && ms().secondaryDevice) {
 							if (!dsiFeatures() && !sys().isRegularDS()) {
 								proceedToLaunch = dsiWareInDSModeMsg(dirContents[scrn].at(CURPOS + PAGENUM * 40).name);
 							}
@@ -3977,16 +4109,9 @@ std::string browseForFile(const std::vector<std::string_view> extensionList) {
 							proceedToLaunch = false;
 							ramDiskMsg(dirContents[scrn].at(CURPOS + PAGENUM * 40).name.c_str());
 						}
-					} else if (bnrRomType[CURPOS] == 7) {
-						if (ms().mdEmulator == TWLSettings::EMegaDriveJenesis && getFileSize(
-							dirContents[scrn].at(CURPOS + PAGENUM * 40).name.c_str()) >
-							0x300000) {
-							proceedToLaunch = false;
-							mdRomTooBig();
-						}
-					} else if ((bnrRomType[CURPOS] == 8 || (bnrRomType[CURPOS] == 11 && ms().smsGgInRam))
-							&& isDSiMode() && memcmp(io_dldi_data->friendlyName, "CycloDS iEvolution", 18) != 0 && sys().arm7SCFGLocked()) {
-						proceedToLaunch = cannotLaunchMsg(dirContents[scrn].at(CURPOS + PAGENUM * 40).name.c_str());
+					} else if (precheck == LaunchPrecheck::MdRomTooBig) {
+						proceedToLaunch = false;
+						mdRomTooBig();
 					}
 					if (hasAP) {
 						if (ms().theme == TWLSettings::EThemeSaturn) {
@@ -4065,7 +4190,7 @@ std::string browseForFile(const std::vector<std::string_view> extensionList) {
 
 					// If SD card's cluster size is less than 32KB, then show warning for DS games with nds-bootstrap
 					extern struct statvfs st[2];
-					if ((useBootstrapAnyway || isDSiWare[CURPOS]) && bnrRomType[CURPOS] == 0 && (!isDSiWare[CURPOS] || (ms().secondaryDevice && (!sdFound() || !ms().dsiWareToSD || bs().b4dsMode))) && isHomebrew[CURPOS] == 0
+					if ((useBootstrapAnyway || isDSiWare[CURPOS]) && !isNdz[CURPOS] && bnrRomType[CURPOS] == 0 && (!isDSiWare[CURPOS] || (ms().secondaryDevice && (!sdFound() || !ms().dsiWareToSD || bs().b4dsMode))) && isHomebrew[CURPOS] == 0
 					 && proceedToLaunch && st[ms().secondaryDevice].f_bsize < (32 << 10) && !ms().dontShowClusterWarning) {
 						if (ms().theme == TWLSettings::EThemeSaturn) {
 							snd().playStartup();
@@ -4160,7 +4285,6 @@ std::string browseForFile(const std::vector<std::string_view> extensionList) {
 							snd().fadeOutStream();
 
 							// Clear screen with white
-							rocketVideo_playVideo = false;
 							tex().unloadRotatingCubes();
 						}
 
@@ -4192,7 +4316,6 @@ std::string browseForFile(const std::vector<std::string_view> extensionList) {
 								// Free some RAM space to avoid possible memory leaks
 								snd().unloadStream();
 								snd().unloadSfxData();
-								tex().unloadPhotoBuffer();
 							}
 
 							mkdir(sys().isRunFromSD() ? "sd:/_nds/TWiLightMenu/extras" : "fat:/_nds/TWiLightMenu/extras",
@@ -4368,7 +4491,7 @@ std::string browseForFile(const std::vector<std::string_view> extensionList) {
 					clearBoxArt(); // Clear box art
 				boxArtLoaded = false;
 				bannerTextShown = false;
-				rocketVideo_playVideo = true;
+				resumeRotatingCubesVideo();
 				shouldersRendered = false;
 				currentBg = 0;
 				showSTARTborder = false;
@@ -4468,14 +4591,38 @@ std::string browseForFile(const std::vector<std::string_view> extensionList) {
 							}
 							whiteScreen = true;
 						}
-						remove(dirContents[scrn]
+						const char* fileNameChar = dirContents[scrn]
 							   .at(CURPOS + PAGENUM * 40)
-							   .name.c_str()); // Remove game/folder
+							   .name.c_str();
+						remove(fileNameChar); // Remove game/folder
+						if (!ms().macroMode && strlen(fileNameChar) >= 6 && extension(fileNameChar, {".gif", ".bmp", ".png"})) {
+							char fileNameCharBottom[128] = {0};
+							char fileNameChar_noExt[128] = {0};
+							sprintf(fileNameChar_noExt, fileNameChar);
+							for (int i = strlen(fileNameChar); i >= 0; i--) {
+								if (fileNameChar_noExt[i] == '.') {
+									fileNameChar_noExt[i] = 0;
+									break;
+								}
+							}
+
+							if (extension(fileNameChar, {".gif"})) {
+								sprintf(fileNameCharBottom, "%s_bot.gif", fileNameChar_noExt);
+							} else if (extension(fileNameChar, {".bmp"})) {
+								sprintf(fileNameCharBottom, "%s_bot.bmp", fileNameChar_noExt);
+							} else if (extension(fileNameChar, {".png"})) {
+								sprintf(fileNameCharBottom, "%s_bot.png", fileNameChar_noExt);
+							}
+
+							if (access(fileNameCharBottom, F_OK) == 0) {
+								remove(fileNameCharBottom); // Remove bottom screen image file
+							}
+						}
 						if (ms().showBoxArt)
 							clearBoxArt(); // Clear box art
 						boxArtLoaded = false;
 						bannerTextShown = false;
-						rocketVideo_playVideo = true;
+						resumeRotatingCubesVideo();
 						shouldersRendered = false;
 						currentBg = 0;
 						showSTARTborder = false;

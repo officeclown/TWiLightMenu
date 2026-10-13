@@ -129,12 +129,20 @@ You can help translate TWiLight Menu++ on the [Crowdin project](https://crowdin.
 - [fail0verflow](https://github.com/fail0verflow/), Fluto, and Arkhandar: Homebrew Channel/Launcher graphics
 - [FlameKat53](https://github.com/FlameKat53): Manual icon for DSi UI's `SELECT` menu
 - [Mr. Start](https://github.com/Arthur-Start): Super Nintendo DS splash screen
-- [PW5190](https://github.com/PW5190): Kirby-themed and Pokémon Day TWLMenu++ splash screens
-- [spinal_cord](https://gbatemp.net/members/spinal_cord.90607/): [DSi4DS](https://gbatemp.net/threads/dsi4ds.173617/) and [DSision2](https://gbatemp.net/threads/dsision2.92740/) graphics
+- [PW5190](https://github.com/PW5190): These TWLMenu++ splash screens:
+     - Kirby
+     - Pokémon Day
+	 - Zelda
+- [spinal_cord](https://gbatemp.net/members/spinal_cord.90607/): DSi Menu and other graphics (such as folder icon) extracted from [DSi4DS](https://gbatemp.net/threads/dsi4ds.173617/) and [DSision2](https://gbatemp.net/threads/dsision2.92740/)
 - [StarvingArtist](https://www.deviantart.com/starvingartist/): Game Console icons
+- Nintendo: DSi text font and graphical/audio assets from the Nintendo DSi Menu and 3DS HOME Menu
+- SEGA: Graphical/audio assets from the SEGA Saturn BIOS menu
+- Sonic Team: The bubble (from Sonic 1) used in the HBL UI
+- Nintendo, HAL Laboratory, Game Freak, The Pokémon Company, syn Sophia, SEGA, and Sonic Team: Graphical/audio assets used in special/easter egg TWLMenu++ splash screens 
 ## Music
 - [BlastoiseVeteran](https://soundcloud.com/blastyveteran): Remastered version of Nintendo DSi Shop music
 - IkaMusumeYiyaRoxie: General N64 MIDI Soundfont, used for the title splash fanfare on old versions
+- syn Sophia: Soundfont (from Style Savvy) used for the default short/long title splash fanfares
 - [TeciorFILM](https://www.youtube.com/channel/UCEyPYQavt2g_tdmkd-pQgYw): The video ([10 Minutes of Nintendo DSi Menu Music (Authentic)](https://www.youtube.com/watch?v=LLc3-z8VZwc)) used for the better DSi Menu music add-on
 ## Sound
 - [dbry](https://github.com/dbry): Xtreme Quality IMA-ADPCM decoder code from [adpcm-xq](https://github.com/dbry/adpcm-xq).
@@ -143,16 +151,18 @@ You can help translate TWiLight Menu++ on the [Crowdin project](https://crowdin.
 - [ahezard](https://github.com/ahezard): NDMA code from nds-bootstrap
 - Another World & Yellow Wood Goblin: The original akMenu/Wood UI
     - [Rocket Robz](https://github.com/RocketRobz): Re-developed the Wood UI with pieces of the original code ported over
+- [ApacheThunder](https://github.com/ApacheThunder): Support for mounting flashcards (which aren't Acekard 2(i) and/or R4(i) Ultra) without the need to launch them first (ported from [GodMode9**i**](https://github.com/DS-Homebrew/GodMode9i))
+    - [tasken](https://github.com/tasken): Allowing booting homebrew from flashcards without the need to launch them first if running from DSi/3DS SD
 - [Arisotura](https://github.com/Arisotura): ROM list from melonDS, and BIOS dumper code from [dsibiosdumper](https://github.com/Arisotura/dsibiosdumper)
 - [Dartz150](https://github.com/Dartz150): Provided fix for *Iridion II* & *Top Gun: Combat Zones* GBA games
 - [devkitPro](https://github.com/devkitPro): Code used in nds-hb-menu, and the use of the bootloader, devkitARM, libnds, and libfat
 - [edo9300](https://github.com/edo9300): DS Phat check code
-- [Gericom](https://github.com/Gericom): Frame rate adjustment code from [FastVideoDSPlayer](https://github.com/Gericom/FastVideoDSPlayer) used in TWLMenu++ splash screen
 - [Gericom](https://github.com/Gericom), TrolleyDave, and FAST6191: GBA SRAM-patching code, used in gbapatcher ([SRAM patching thread at GBAtemp](https://gbatemp.net/threads/reverse-engineering-gba-patching.60168/))
 - [Gericom](https://github.com/Gericom) & [profi200](https://github.com/profi200): GBA color correction code, used in [GBARunner3](https://github.com/Gericom/GBARunner3)
 - Nikokaro: Found no-tilt patches for *WarioWare: Twisted!*, and *Yoshi Topsy-Turvy*. ([GBAtemp thread](https://gbatemp.net/threads/gba-no-tilt-patches-for-ds-users.584128/))
 - [Lorenzooone](https://github.com/Lorenzooone): Improvements to Slot-1 launcher, and added support for booting DSi-Enhanced/Exclusive game cards in DSi mode
 - [profi200](https://github.com/profi200): Improved SD code from fastboot3DS
+- [PW5190](https://github.com/PW5190): ESRB info contributions
 - RadDude McCoolguy, fintogive, KazoWAR, Vague Rant, [gamemasterplc](https://github.com/gamemasterplc), [Rocket Robz](https://github.com/RocketRobz), [ChampionLeake](https://github.com/ChampionLeake), [DeadSkullzJr](https://github.com/DeadSkullzJr), [spellboundtriangle](https://github.com/spellboundtriangle), [LedyBacer](https://github.com/LedyBacer): Widescreen cheats
 - [SNBeast](https://github.com/SNBeast): Unlaunch patches
 - Taiju Yamada: Code used to bypass R4i-SDHC boot file protection

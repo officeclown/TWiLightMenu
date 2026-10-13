@@ -33,6 +33,7 @@
 #include "common/flashcard.h"
 #include <gl2d.h>
 #include "common/lzss.h"
+#include "common/tonccpy.h"
 #include "common/systemdetails.h"
 #include "common/my_rumble.h"
 #include "common/logging.h"
@@ -97,6 +98,7 @@ extern bool showSTARTborder;
 extern bool needToPlayStopSound;
 extern int waitForNeedToPlayStopSound;
 extern int movingApp;
+extern int movingAppXpos;
 extern int movingAppYpos;
 extern bool movingAppIsDir;
 extern bool draggingIcons;
@@ -179,12 +181,32 @@ int vblankRefreshCounter = 0;
 u32 rotatingCubesLoaded = false;	// u32 used instead of bool, to fix a weird bug
 
 bool rocketVideo_playVideo = false;
+bool rocketVideo_topVisible = true;	// False while box art covers the top band
 int rocketVideo_videoYpos = 78;
+int rocketVideo_videoYposBottom = 78;
 int frameOf60fps = 60;
-int rocketVideo_videoFrames = 249;
-int rocketVideo_currentFrame = -1;
+int rocketVideo_videoFrames = 249;	// Last frame number in the file
+int rocketVideo_loopFrame = 0;		// Frame the video goes back to after the last one
+int rocketVideo_currentFrame = 0;	// Next frame to blit
+int rocketVideo_prevFrame = -1;		// Last frame blitted, or -1
+bool rocketVideo_field = false;		// Field of rocketVideo_currentFrame when interlaced
 u8 rocketVideo_fps = 25;
-u8 rocketVideo_height = 56;
+u8 rocketVideo_height = 56;		// Stored rows per frame; the field height when interlaced
+u8 rocketVideo_bandHeight = 56;		// Rows the video occupies on screen
+bool rocketVideo_interlaced = false;
+bool rocketVideo_dualScreen = false;	// Two sub-frames per frame, top then bottom
+bool rocketVideo_onTop = true;		// A band plays on the top screen
+bool rocketVideo_onBottom = false;	// A band plays on the bottom screen
+bool rocketVideo_indexed = false;	// 8 BPP: frames hold palette indices followed by their palette
+bool rocketVideo_hasAlpha = false;	// Pixels with bit 15 clear show the theme behind them
+u32 *rocketVideo_spanIndex = NULL;	// Per sub-frame offsets into rocketVideo_spanData
+u16 *rocketVideo_spanData = NULL;	// Alpha run lists, see AlphaSpanWriter
+bool rocketVideo_weaveRefill = false;	// Repaint both fields on the next frame
+// Top screen GUI pixels inside the band, kept in front of the video: per screen row, the
+// number of [start, end) pairs in rocketVideo_guiRuns. Built by ThemeTextures::flushTopGui().
+u8 rocketVideo_guiRunCount[SCREEN_HEIGHT] = {0};
+u16 rocketVideo_guiRuns[SCREEN_HEIGHT][2 * ROCKET_VIDEO_GUI_RUNS] = {{0}};
+int rocketVideo_guiRows = 0;		// Rows with a non-zero rocketVideo_guiRunCount
 int rocketVideo_frameDelay = 0;
 bool rocketVideo_frameDelayEven = true; // For 24FPS
 bool rocketVideo_loadFrame = true;
@@ -260,6 +282,7 @@ void SetBrightness(u8 screen, s8 bright) {
 // }
 
 void bottomBgLoad(int drawBubble, bool init = false) {
+	const int bottomBgStateBefore = bottomBgState;
 	if (init || drawBubble == 0 || (drawBubble == 2 && ms().theme == TWLSettings::ETheme3DS)) {
 		if (bottomBgState != 1) {
 			tex().drawBottomBg(1);
@@ -276,6 +299,15 @@ void bottomBgLoad(int drawBubble, bool init = false) {
 			bottomBgState = 3;
 		}
 	}
+	// drawBottomBg() commits around the second video band, whose transparent pixels still
+	// show the old background until the band is fully repainted.
+	if (rotatingCubesLoaded && rocketVideo_onBottom && bottomBgState != bottomBgStateBefore) {
+		const int oldIE = enterCriticalSection();
+		rocketVideo_loadFrame = true;	// Repaint the band without waiting for the next frame
+		rocketVideo_weaveRefill = true;
+		leaveCriticalSection(oldIE);
+	}
+
 	if (ms().macroMode && prevBottomBgState != bottomBgState) {
 		reloadDate = true;
 		reloadTime = true;
@@ -383,25 +415,343 @@ void frameRateHandler(void) {
 	}
 }
 
+// Last frame blitted to each screen's even and odd rows, or -1 when unknown. Only
+// transparent pixels that were opaque in that frame need the background put back:
+// everywhere else the background is already on screen.
+// Screen 0 is the top band and 1 the bottom band.
+static int alphaLastFrame[2][2] = {{-1, -1}, {-1, -1}};
+
+// Band lines of each screen's fields whose background changed since they were last blitted,
+// as [start, end). They restore every transparent pixel, not only those the previous frame
+// covered.
+static int alphaDirtyStart[2][2] = {{0, 0}, {0, 0}};
+static int alphaDirtyEnd[2][2] = {{0, 0}, {0, 0}};
+
+void resetVideoAlphaTracking(void) {
+	for (int screen = 0; screen < 2; screen++) {
+		alphaLastFrame[screen][0] = -1;
+		alphaLastFrame[screen][1] = -1;
+	}
+}
+
+// The background under screen rows [y0, y1) of a band changed.
+void invalidateVideoAlphaRows(int screen, int y0, int y1) {
+	const int bandY = screen ? rocketVideo_videoYposBottom : rocketVideo_videoYpos;
+	int r0 = y0 - bandY;
+	int r1 = y1 - bandY;
+	if (r0 < 0) r0 = 0;
+	if (r1 > rocketVideo_bandHeight) r1 = rocketVideo_bandHeight;
+	if (r0 >= r1) return;
+
+	const int oldIE = enterCriticalSection();
+	for (int parity = 0; parity < 2; parity++) {
+		int start = r0, end = r1;
+		if (rocketVideo_interlaced) {
+			// Field line l covers band row 2l + parity
+			start = (r0 - parity + 1) / 2;
+			end = (r1 - parity + 1) / 2;
+		} else if (parity) {
+			break;
+		}
+		if (start >= end) continue;
+		if (alphaDirtyStart[screen][parity] >= alphaDirtyEnd[screen][parity]) {
+			alphaDirtyStart[screen][parity] = start;
+			alphaDirtyEnd[screen][parity] = end;
+		} else {
+			if (start < alphaDirtyStart[screen][parity]) alphaDirtyStart[screen][parity] = start;
+			if (end > alphaDirtyEnd[screen][parity]) alphaDirtyEnd[screen][parity] = end;
+		}
+	}
+	leaveCriticalSection(oldIE);
+}
+
+static inline void copyVideoRun(u16 *dst, const u16 *src, int x, int end) {
+	tonccpy(dst + x, src + x, sizeof(u16) * (end - x));
+}
+
+// Write one field of an interlaced video into every other row of the band, leaving the
+// rows of the opposite field in place. The theme's whole UI shares the bitmap layer, so
+// the affine stretch a dedicated player would use is not available here.
+// Blocking transfers: the channel is free again by the time this returns, which keeps the
+// dmaBusy() waits elsewhere correct.
+ITCM_CODE static void weaveVideoField(u8 channel, const u8 *src, u16 *bandTop, int parity) {
+	u16 *dst = bandTop + (parity ? SCREEN_WIDTH : 0);
+	for (u8 line = 0; line < rocketVideo_height; line++) {
+		dmaCopyWords(channel, src, dst, 0x200);
+		src += 0x200;
+		dst += SCREEN_WIDTH * 2;
+	}
+}
+
+// Span row header for a row whose run list did not fit: blit it pixel by pixel.
+#define ALPHA_ROW_PER_PIXEL 0xFFFF
+
+static inline const u16 *nextAlphaRow(const u16 *row) {
+	return row + 1 + ((*row == ALPHA_ROW_PER_PIXEL) ? 0 : *row);
+}
+
+// Write one row from its run list: opaque runs from the video, transparent runs from the
+// background where the previous frame's row (if known) had opaque pixels.
+ITCM_CODE static void blitAlphaRow(const u16 *src, u16 *dst, const u16 *bg, const u16 *cur, const u16 *prev) {
+	if (*cur == ALPHA_ROW_PER_PIXEL) {
+		for (int x = 0; x < SCREEN_WIDTH; x++) {
+			dst[x] = (src[x] & BIT(15)) ? src[x] : bg[x];
+		}
+		return;
+	}
+	if (prev && *prev == ALPHA_ROW_PER_PIXEL) {
+		prev = NULL; // Its runs are unknown, so restore every transparent pixel
+	}
+
+	int curFlips = *cur++;
+	int prevFlips = 0;
+	if (prev) prevFlips = *prev++;
+	bool prevOpaque = true;
+
+	int x = 0;
+	bool opaque = true;
+	while (x < SCREEN_WIDTH) {
+		const int end = curFlips ? *cur : SCREEN_WIDTH;
+		if (curFlips) {
+			cur++;
+			curFlips--;
+		}
+		if (end > x) {
+			if (opaque) {
+				copyVideoRun(dst, src, x, end);
+			} else if (!prev) {
+				copyVideoRun(dst, bg, x, end);
+			} else {
+				for (int a = x; a < end;) {
+					int prevEnd = prevFlips ? *prev : SCREEN_WIDTH;
+					while (prevEnd <= a) {
+						prev++;
+						prevFlips--;
+						prevOpaque = !prevOpaque;
+						prevEnd = prevFlips ? *prev : SCREEN_WIDTH;
+					}
+					const int b = (prevEnd < end) ? prevEnd : end;
+					if (prevOpaque) copyVideoRun(dst, bg, a, b);
+					a = b;
+				}
+			}
+		}
+		x = end;
+		opaque = !opaque;
+	}
+}
+
+// screen picks the band's tracking, subFrame which of the frame's stored pictures to show.
+ITCM_CODE static void blitAlphaBand(int screen, u32 subFrame, const u16 *src, u16 *dst, const u16 *bg, int frame, int parity) {
+	const u32 screens = rocketVideo_dualScreen ? 2 : 1;
+	const u16 *cur = rocketVideo_spanData + rocketVideo_spanIndex[(u32)frame * screens + subFrame];
+	const int prevFrame = alphaLastFrame[screen][parity];
+	const u16 *prev = (prevFrame < 0) ? NULL
+		: rocketVideo_spanData + rocketVideo_spanIndex[(u32)prevFrame * screens + subFrame];
+	const int dirtyStart = alphaDirtyStart[screen][parity];
+	const int dirtyEnd = alphaDirtyEnd[screen][parity];
+
+	const int rowStep = SCREEN_WIDTH * (rocketVideo_interlaced ? 2 : 1);
+	if (parity) {
+		dst += SCREEN_WIDTH;
+		bg += SCREEN_WIDTH;
+	}
+	for (int line = 0; line < rocketVideo_height; line++) {
+		const u16 *curNext = nextAlphaRow(cur);
+		const u16 *prevNext = prev ? nextAlphaRow(prev) : NULL;
+		const bool dirty = (line >= dirtyStart && line < dirtyEnd);
+		blitAlphaRow(src, dst, bg, cur, dirty ? NULL : prev);
+		cur = curNext;
+		prev = prevNext;
+		src += SCREEN_WIDTH;
+		dst += rowStep;
+		bg += rowStep;
+	}
+	alphaLastFrame[screen][parity] = frame;
+	alphaDirtyStart[screen][parity] = 0;
+	alphaDirtyEnd[screen][parity] = 0;
+}
+
+// The top screen's GUI is drawn into the same bitmap as the video, so copy its pixels back
+// over the band to keep it in front.
+ITCM_CODE static void overlayTopGui(u16 *band, const u16 *gui) {
+	for (int line = 0; line < rocketVideo_bandHeight; line++) {
+		const u16 *run = rocketVideo_guiRuns[rocketVideo_videoYpos + line];
+		for (int i = rocketVideo_guiRunCount[rocketVideo_videoYpos + line]; i > 0; i--, run += 2) {
+			copyVideoRun(band, gui, run[0], run[1]);
+		}
+		band += SCREEN_WIDTH;
+		gui += SCREEN_WIDTH;
+	}
+}
+
+// 8 BPP videos keep each sub-frame as palette indices followed by its palette, and only turn
+// into 16 BPP here: half the memory of storing them expanded, for a lookup per pixel.
+ITCM_CODE static void expandIndexedBand(u16 *band, const u8 *frame, int parity) {
+	const u16 *const palette = (const u16*)(frame + (0x100 * rocketVideo_height));
+	const int rowStep = SCREEN_WIDTH * (rocketVideo_interlaced ? 2 : 1);
+	u16 *row = band + (parity ? SCREEN_WIDTH : 0);
+	const u8 *index = frame;
+	for (int line = 0; line < rocketVideo_height; line++) {
+		for (int x = 0; x < SCREEN_WIDTH; x++) {
+			row[x] = palette[index[x]];
+		}
+		index += SCREEN_WIDTH;
+		row += rowStep;
+	}
+}
+
+static void blitVideoFrame(int frame, int parity) {
+	const u32 frameBytes = rocketVideo_indexed ? (0x100 * rocketVideo_height) + 0x200 : 0x200 * rocketVideo_height;
+	const u32 stride = rocketVideo_dualScreen ? frameBytes * 2 : frameBytes;
+	const u8 *src = rotatingCubesLocation + ((u32)frame * stride);
+	const u32 bottomSubFrame = rocketVideo_dualScreen ? 1 : 0;
+	const u8 *bottomSrc = src + (bottomSubFrame * frameBytes);
+	const bool top = rocketVideo_onTop && rocketVideo_topVisible;
+	const bool bottom = rocketVideo_onBottom;
+	u16 *topBand = (u16*)BG_GFX_SUB + (SCREEN_WIDTH * rocketVideo_videoYpos);
+	u16 *bottomBand = (u16*)BG_GFX + (SCREEN_WIDTH * rocketVideo_videoYposBottom);
+	const u16 *topBg = tex().bgSubBuffer() + (SCREEN_WIDTH * rocketVideo_videoYpos);
+
+	if (rocketVideo_indexed) {
+		if (!rocketVideo_interlaced) parity = 0;
+		if (top)
+			expandIndexedBand(topBand, src, parity);
+		if (bottom)
+			expandIndexedBand(bottomBand, bottomSrc, parity);
+	} else if (rocketVideo_hasAlpha) {
+		if (!rocketVideo_interlaced) parity = 0;
+		if (top)
+			blitAlphaBand(0, 0, (const u16*)src, topBand, topBg, frame, parity);
+		if (bottom)
+			blitAlphaBand(1, bottomSubFrame, (const u16*)bottomSrc, bottomBand,
+				tex().bgMainBuffer() + (SCREEN_WIDTH * rocketVideo_videoYposBottom), frame, parity);
+	} else if (rocketVideo_interlaced) {
+		if (top)
+			weaveVideoField(1, src, topBand, parity);
+		if (bottom)
+			weaveVideoField(0, bottomSrc, bottomBand, parity);
+	} else {
+		if (top) {
+			// The GUI overlay has to land after the frame. A CPU copy: a blocking DMA transfer of
+			// a whole frame would hold this handler, and the main thread with it, for far longer
+			if (rocketVideo_guiRows) {
+				tonccpy(topBand, src, frameBytes);
+			} else {
+				dmaCopyWordsAsynch(1, src, topBand, frameBytes);
+			}
+		}
+		if (bottom)
+			dmaCopyWordsAsynch(0, bottomSrc, bottomBand, frameBytes);
+	}
+
+	if (top && rocketVideo_guiRows) {
+		overlayTopGui(topBand, topBg);
+	}
+}
+
+// Resume playback after the band has been covered by box art or a background redraw.
+void resumeRotatingCubesVideo(void) {
+	const int oldIE = enterCriticalSection();
+	rocketVideo_playVideo = true;
+	rocketVideo_topVisible = true;
+	rocketVideo_weaveRefill = true;
+	leaveCriticalSection(oldIE);
+}
+
+// Set when a CPU blit (alpha or 8 BPP) ran past the end of vblank and into the next frame's scan.
+static bool blitOverrun = false;
+// Set when the last tick only laid down the opposite field, so this one must show a frame.
+static bool alphaRefillDeferred = false;
+
+static void advanceVideoFrame(void) {
+	rocketVideo_prevFrame = rocketVideo_currentFrame;
+	rocketVideo_currentFrame++;
+	if (rocketVideo_currentFrame > rocketVideo_videoFrames) {
+		rocketVideo_currentFrame = rocketVideo_loopFrame;
+	}
+	rocketVideo_field = !rocketVideo_field;
+	rocketVideo_frameDelay = 0;
+	rocketVideo_frameDelayEven = !rocketVideo_frameDelayEven;
+	rocketVideo_loadFrame = false;
+}
+
 void playRotatingCubesVideo(void) {
 	if (!rocketVideo_playVideo || !rocketVideo_loadFrame)
 		return;
 
-	dmaCopyWordsAsynch(1, rotatingCubesLocation+(rocketVideo_currentFrame*(0x200*rocketVideo_height)), (u16*)BG_GFX_SUB+(256*rocketVideo_videoYpos), 0x200*rocketVideo_height);
-
-	rocketVideo_currentFrame++;
-	if (rocketVideo_currentFrame > rocketVideo_videoFrames) {
-		rocketVideo_currentFrame = 0;
+	// Transparent and 8 BPP videos are blitted by the CPU inside this handler. If the last blit ran
+	// into the next frame, sit this vblank out so the main thread gets a whole frame to run:
+	// otherwise the handler can keep re-entering and starve it. rocketVideo_loadFrame stays
+	// set, so the same frame goes out on the next vblank. Skipping a frame instead would
+	// leave an interlaced video filling the same field over and over.
+	if ((rocketVideo_hasAlpha || rocketVideo_indexed) && blitOverrun) {
+		blitOverrun = false;
+		return;
 	}
-	rocketVideo_frameDelay = 0;
-	rocketVideo_frameDelayEven = !rocketVideo_frameDelayEven;
-	rocketVideo_loadFrame = false;
+
+	// After the band has been painted over, an interlaced video only fills half of its
+	// rows per frame, so lay down the opposite field first.
+	if (rocketVideo_weaveRefill && alphaRefillDeferred) {
+		// Asked again before the deferred frame went out: that frame goes first, so a refill
+		// requested over and over still lets the video advance
+		rocketVideo_weaveRefill = false;
+		resetVideoAlphaTracking();
+	} else if (rocketVideo_weaveRefill) {
+		rocketVideo_weaveRefill = false;
+		resetVideoAlphaTracking(); // What is on screen in the band is no longer known
+		if (rocketVideo_interlaced) {
+			const int other = (rocketVideo_prevFrame >= 0) ? rocketVideo_prevFrame : rocketVideo_currentFrame;
+			blitVideoFrame(other, !rocketVideo_field);
+			if (rocketVideo_hasAlpha) {
+				// Two full alpha restores are too much for one vblank: rocketVideo_loadFrame
+				// stays set, so the current frame goes out on the next one.
+				blitOverrun = (REG_VCOUNT < 192);
+				alphaRefillDeferred = true;
+				return;
+			}
+		}
+	} else if (rocketVideo_prevFrame >= 0 && rocketVideo_currentFrame < rocketVideo_prevFrame) {
+		// Anything that slipped into the band unnoticed would otherwise stay until those
+		// pixels turn opaque again, so restore the whole backdrop once per loop.
+		resetVideoAlphaTracking();
+	}
+
+	blitVideoFrame(rocketVideo_currentFrame, rocketVideo_field);
+	alphaRefillDeferred = false;
+	if (rocketVideo_hasAlpha || rocketVideo_indexed) {
+		blitOverrun = (REG_VCOUNT < 192);
+	}
+
+	advanceVideoFrame();
 }
 
 void vBlankHandler() {
 	execQueue();		   // Execute any actions queued during last vblank.
 	execDeferredIconUpdates(); // Update any icons queued during last vblank.
 	loadDeferredIconPalettes();
+
+	// Periodic palette repair. This has to sit up here with the other VRAM work:
+	// glColorTableEXT unmaps VRAM E/F/G (texture palettes and main sprite) while it
+	// copies, so running it further down -- after the video blit, the whole gl2d
+	// list and before bottomBgRefresh's DMAs -- puts it past the end of vblank and
+	// tears the screen once every REFRESH_EVERY_VBLANKS frames. Reading dbox_Ypos
+	// before this frame's slide updates it only shifts the repair by one frame.
+	// Skipped rather than clamped when out of blanking: the counter is left at the
+	// threshold so the repair simply happens on the next vblank instead.
+	if (vblankRefreshCounter >= REFRESH_EVERY_VBLANKS) {
+		if (vramSafeToUnmap()) {
+			if (showdialogbox && dbox_Ypos == -192) {
+				// Reload the dialog box palettes here...
+				reloadDboxPalette();
+			} else if (!showdialogbox) {
+				reloadIconPalettes();
+			}
+			vblankRefreshCounter = 0;
+		}
+	} else {
+		vblankRefreshCounter++;
+	}
 
 	if (waitForNeedToPlayStopSound > 0) {
 		waitForNeedToPlayStopSound++;
@@ -420,6 +770,7 @@ void vBlankHandler() {
 	static bool showProgressBarPrev = showProgressBar;
 	static int progressBarLengthPrev = progressBarLength;
 	static bool dbox_showIconPrev = dbox_showIcon;
+	static int movingAppXposPrev = movingAppXpos;
 	static int movingAppYposPrev = movingAppYpos;
 
 	if (whiteScreenPrev != whiteScreen) {
@@ -684,6 +1035,13 @@ void vBlankHandler() {
 		updateFrame = true;
 	}
 
+	// The stylus drag moves the carried box horizontally without touching
+	// anything else, so nothing above would mark the frame dirty.
+	if (movingAppXposPrev != movingAppXpos) {
+		movingAppXposPrev = movingAppXpos;
+		updateFrame = true;
+	}
+
 	if (applaunchprep && titleboxYmovepos < 192) {
 		titleboxYmovepos += 5;
 		updateFrame = true;
@@ -737,7 +1095,7 @@ void vBlankHandler() {
 		// Playback animated icons
 		for (int i = 0; i < ((movingApp != -1) ? 41 : 40); i++) {
 			if (bnriconisDSi[i] && playBannerSequence(i) && !updateFrame) {
-				updateFrame = (displayGameIcons && (ms().theme != TWLSettings::EThemeSaturn)) ? ((i >= CURPOS-2 && i <= CURPOS+2) || i == 40) : (i == CURPOS);
+				updateFrame = (displayGameIcons && (ms().theme != TWLSettings::EThemeSaturn)) ? ((i >= CURPOS-ICON_GRID_MAX_OFFSET && i <= CURPOS+ICON_GRID_MAX_OFFSET) || i == 40) : (i == CURPOS);
 			}
 		}
 	}
@@ -890,7 +1248,11 @@ void vBlankHandler() {
 			int realCurPos = (titleboxXpos[ms().secondaryDevice] + 32) / titleboxXspacing;
 			int titleboxOffset = (realCurPos * titleboxXspacing) - (titleboxXpos[ms().secondaryDevice]);
 
-			int maxIconNumber = (ms().theme == TWLSettings::EThemeSaturn ? 0 : 3);
+			// One icon bank per box drawn below, or two boxes in the same frame
+			// alias onto one bank (see ICON_GRID_BANKS in iconHandler.h).
+			static_assert(2 * ICON_GRID_MAX_OFFSET + 1 <= ICON_GRID_BANKS,
+					  "icon grid draws more boxes than it has texture banks");
+			int maxIconNumber = (ms().theme == TWLSettings::EThemeSaturn ? 0 : ICON_GRID_MAX_OFFSET);
 			for (int pos = std::max(CURPOS - maxIconNumber, 0); pos <= std::min(CURPOS + maxIconNumber, 39); pos++) {
 				int i = pos;
 
@@ -921,12 +1283,33 @@ void vBlankHandler() {
 						}
 					}
 				} else {
+					// Move mode. insertSlotAtScreenX() in fileBrowse.cpp is the inverse
+					// of this layout -- keep the two in step.
 					spawnedboxXpos = 96 + 38 + pos * titleboxXspacing;
 					iconXpos = 112 + 38 + pos * titleboxXspacing;
 
 					if (i >= movingApp - (PAGENUM * 40))
 						i++;
+
+					// The gap left by the moving app shifts content one slot right,
+					// which would widen the entries drawn this frame to
+					// [CURPOS-3, CURPOS+4] -- one more than ICON_GRID_BANKS, so two
+					// would alias. The extra box sits off the right of the screen
+					// (move mode uses titleboxXspacing 76), so drop it instead.
+					// continue, not break: the DSi brace below reads the loop's
+					// final spawnedboxXpos, which is already assigned above.
+					if (i > CURPOS + maxIconNumber)
+						continue;
 				}
+
+				// Positions are final here (after the DSi nudge and the move-mode
+				// shift), so skip boxes that fall entirely off-screen. Saves up to
+				// two glSprite/drawIcon pairs per frame and stops drawIcon marking
+				// palettes dirty for entries nobody can see. Every sprite drawn at
+				// this x (box full/empty, folder, settings) is a fixed 64px wide.
+				const int boxScreenX = spawnedboxXpos - titleboxXpos[ms().secondaryDevice];
+				if (boxScreenX <= -64 || boxScreenX >= SCREEN_WIDTH)
+					continue;
 
 				if (i < spawnedtitleboxes) {
 					if (isDirectory[i]) {
@@ -978,33 +1361,38 @@ void vBlankHandler() {
 			}
 
 			if (movingApp != -1) {
+				// movingAppXpos is the carried box'''s screen x: 96 when it sits on the
+				// gap (the keypad move mode never changes it), or wherever the stylus
+				// has dragged it to. +16 is the icon'''s inset inside the 64px box, the
+				// same 112 - 96 relationship the row above uses.
+				const int movingIconXpos = movingAppXpos + 16;
 				if (movingAppIsDir) {
 					if (ms().theme == TWLSettings::ETheme3DS)
-						glSprite(96, titleboxYpos - movingAppYpos, GL_FLIP_NONE, tex().folderImage());
+						glSprite(movingAppXpos, titleboxYpos - movingAppYpos, GL_FLIP_NONE, tex().folderImage());
 					else
-						glSprite(96, titleboxYpos - movingAppYpos + titleboxYposDropDown[movingApp % 5],
+						glSprite(movingAppXpos, titleboxYpos - movingAppYpos + titleboxYposDropDown[movingApp % 5],
 								 GL_FLIP_NONE, tex().folderImage());
-					if (customIcon[movingApp])
-						drawIcon(112,
+					if (customIcon[MOVING_APP_SLOT])
+						drawIcon(movingIconXpos,
 								 (titleboxYpos + iconYposOnTitleBox) - movingAppYpos + titleboxYposDropDown[movingApp % 5],
 								 -1);
 				} else {
-					if (!bnrSysSettings[movingApp]) {
+					if (!bnrSysSettings[MOVING_APP_SLOT]) {
 						if (ms().theme == TWLSettings::ETheme3DS) {
-							glSprite(96, titleboxYpos - movingAppYpos, GL_FLIP_NONE,
+							glSprite(movingAppXpos, titleboxYpos - movingAppYpos, GL_FLIP_NONE,
 									 tex().boxfullImage());
 						} else {
-							glSprite(96,
+							glSprite(movingAppXpos,
 									 titleboxYpos - movingAppYpos + titleboxYposDropDown[movingApp % 5],
 									 GL_FLIP_NONE, &tex().boxfullImage()[0]);
 						}
 					}
-					if (bnrSysSettings[movingApp])
-						glSprite(96,
+					if (bnrSysSettings[MOVING_APP_SLOT])
+						glSprite(movingAppXpos,
 								 (titleboxYpos - 1) - movingAppYpos + titleboxYposDropDown[movingApp % 5],
 								 GL_FLIP_NONE, &tex().settingsImage()[1]);
 					else
-						drawIcon(112, (titleboxYpos + iconYposOnTitleBox) - movingAppYpos + titleboxYposDropDown[movingApp % 5], -1);
+						drawIcon(movingIconXpos, (titleboxYpos + iconYposOnTitleBox) - movingAppYpos + titleboxYposDropDown[movingApp % 5], -1);
 				}
 			}
 
@@ -1239,18 +1627,6 @@ void vBlankHandler() {
 		updateFrame = false;
 	}
 
-	if (vblankRefreshCounter >= REFRESH_EVERY_VBLANKS) {
-		if (showdialogbox && dbox_Ypos == -192) {
-			// Reload the dialog box palettes here...
-			reloadDboxPalette();
-		} else if (!showdialogbox) {
-			reloadIconPalettes();
-		}
-		vblankRefreshCounter = 0;
-	} else {
-		vblankRefreshCounter++;
-	}
-
 	if (boxArtColorDeband) {
 		//ndmaCopyWordsAsynch(0, tex().frameBuffer(secondBuffer), BG_GFX, 0x18000);
 		dmaCopyHalfWordsAsynch(1, tex().frameBufferBot(secondBuffer), BG_GFX_SUB, 0x18000);
@@ -1260,15 +1636,16 @@ void vBlankHandler() {
 	bottomBgRefresh(); // Refresh the background image on vblank
 }
 
+bool allowNewPhotoLoad = true;
 static bool currentPhotoIsBootstrap = false;
 static std::string currentPhotoPath;
 static int currentBootstrapPhoto = 0;
 
-void loadPhoto(const std::string &path, const bool bufferOnly);
-void loadBootstrapScreenshot(FILE *file, const bool bufferOnly);
+void loadPhoto(const std::string &path);
+void loadBootstrapScreenshot(FILE *file);
 
 bool loadPhotoList() {
-	if (!tex().photoBuffer()) {
+	if (!allowNewPhotoLoad) {
 		return false;
 	}
 
@@ -1297,7 +1674,7 @@ bool loadPhotoList() {
 		closedir(dir);
 		if (photoList.size() > 0) {
 			currentPhotoPath = photoList[rand() / ((RAND_MAX + 1u) / photoList.size())];
-			loadPhoto(currentPhotoPath, false);
+			loadPhoto(currentPhotoPath);
 			currentPhotoIsBootstrap = false;
 			return true;
 		}
@@ -1320,7 +1697,7 @@ bool loadPhotoList() {
 		if (screenshots.size() > 0) {
 			currentBootstrapPhoto = screenshots[rand() % screenshots.size()];
 			fseek(file, 0x200 + 0x18400 * currentBootstrapPhoto, SEEK_SET);
-			loadBootstrapScreenshot(file, false);
+			loadBootstrapScreenshot(file);
 			currentPhotoIsBootstrap = true;
 			return true;
 		}
@@ -1330,161 +1707,113 @@ bool loadPhotoList() {
 	char path[64];
 	snprintf(path, sizeof(path), "nitro:/languages/%s/photo_default.png", ms().getGuiLanguageString().c_str());
 	currentPhotoPath = path;
-	loadPhoto(path, false);
+	loadPhoto(path);
 	currentPhotoIsBootstrap = false;
 	return true;
 }
 
-void reloadPhoto() {
-	if (!currentPhotoIsBootstrap) {
-		loadPhoto(currentPhotoPath, true);
-		return;
-	}
-
-	// If no photos found, try find a bootstrap screenshot
-	FILE *file = fopen(sys().isRunFromSD() ? "sd:/_nds/nds-bootstrap/screenshots.tar" : "fat:/_nds/nds-bootstrap/screenshots.tar", "rb");
-	if (!file)
-		file = fopen(sys().isRunFromSD() ? "fat:/_nds/nds-bootstrap/screenshots.tar" : "sd:/_nds/nds-bootstrap/screenshots.tar", "rb");
-	
-	if (!file) {
-		return;
-	}
-
-	std::vector<int> screenshots;
-	fseek(file, 0x200, SEEK_SET);
-	for (int i = 0; i < 50; i++) {
-		if (fgetc(file) == 'B')
-			screenshots.push_back(i);
-		fseek(file, 0x18400 - 1, SEEK_CUR);
-	}
-
-	if (screenshots.size() > 0) {
-		fseek(file, 0x200 + 0x18400 * currentBootstrapPhoto, SEEK_SET);
-		loadBootstrapScreenshot(file, true);
-	}
-}
-
-void loadPhoto(const std::string &path, const bool bufferOnly) {
+void loadPhoto(const std::string &path) {
 	std::vector<unsigned char> image;
 	bool alternatePixel = false;
+	bool alternatePixel2 = false;
 
 	lodepng::decode(image, photoWidth, photoHeight, path);
 
 	if (photoWidth > 208 || photoHeight > 156) {
 		image.clear();
 		// Image is too big, load the default
-		lodepng::decode(image, photoWidth, photoHeight, "nitro:/graphics/photo_default.png");
+		char path[64];
+		snprintf(path, sizeof(path), "nitro:/languages/%s/photo_default.png", ms().getGuiLanguageString().c_str());
+		currentPhotoPath = path;
+		lodepng::decode(image, photoWidth, photoHeight, path);
 	}
 
-	for (uint i=0;i<image.size()/4;i++) {
-		u8 pixelAdjustInfo = 0;
-		if (boxArtColorDeband) {
-			if (alternatePixel) {
-				if (image[(i*4)] >= 0x4 && image[(i*4)] < 0xFC) {
-					image[(i*4)] += 0x4;
-					pixelAdjustInfo |= BIT(0);
-				}
-				if (image[(i*4)+1] >= 0x4 && image[(i*4)+1] < 0xFC) {
-					image[(i*4)+1] += 0x4;
-					pixelAdjustInfo |= BIT(1);
-				}
-				if (image[(i*4)+2] >= 0x4 && image[(i*4)+2] < 0xFC) {
-					image[(i*4)+2] += 0x4;
-					pixelAdjustInfo |= BIT(2);
-				}
-				if (image[(i*4)+3] >= 0x4 && image[(i*4)+3] < 0xFC) {
-					image[(i*4)+3] += 0x4;
-					pixelAdjustInfo |= BIT(3);
-				}
-			}
-		}
-		u16 color = image[i*4]>>3 | (image[(i*4)+1]>>3)<<5 | (image[(i*4)+2]>>3)<<10 | BIT(15);
-		if (image[(i*4)+3] == 255) {
-			tex().photoBuffer()[i] = color;
-		} else {
-			tex().photoBuffer()[i] = alphablend(color, 0, image[(i*4)+3]);
-		}
-		if (colorTable) {
-			tex().photoBuffer()[i] = colorTable[tex().photoBuffer()[i] % 0x8000] | BIT(15);
-		}
-		if (boxArtColorDeband) {
-			if (alternatePixel) {
-				if (pixelAdjustInfo & BIT(0)) {
-					image[(i*4)] -= 0x4;
-				}
-				if (pixelAdjustInfo & BIT(1)) {
-					image[(i*4)+1] -= 0x4;
-				}
-				if (pixelAdjustInfo & BIT(2)) {
-					image[(i*4)+2] -= 0x4;
-				}
-				if (pixelAdjustInfo & BIT(3)) {
-					image[(i*4)+3] -= 0x4;
-				}
-			} else {
-				if (image[(i*4)] >= 0x4 && image[(i*4)] < 0xFC) {
-					image[(i*4)] += 0x4;
-				}
-				if (image[(i*4)+1] >= 0x4 && image[(i*4)+1] < 0xFC) {
-					image[(i*4)+1] += 0x4;
-				}
-				if (image[(i*4)+2] >= 0x4 && image[(i*4)+2] < 0xFC) {
-					image[(i*4)+2] += 0x4;
-				}
-				if (image[(i*4)+3] >= 0x4 && image[(i*4)+3] < 0xFC) {
-					image[(i*4)+3] += 0x4;
-				}
-			}
-			color = image[i*4]>>3 | (image[(i*4)+1]>>3)<<5 | (image[(i*4)+2]>>3)<<10 | BIT(15);
-			if (image[(i*4)+3] == 255) {
-				tex().photoBuffer2()[i] = color;
-			} else {
-				tex().photoBuffer2()[i] = alphablend(color, 0, image[(i*4)+3]);
-			}
-			if (colorTable) {
-				tex().photoBuffer2()[i] = colorTable[tex().photoBuffer2()[i] % 0x8000] | BIT(15);
-			}
-			if ((i % photoWidth) == photoWidth-1) alternatePixel = !alternatePixel;
-			alternatePixel = !alternatePixel;
-		}
-	}
-
-	if (bufferOnly) {
-		return;
-	}
-
+	u16* topBorderBuffer = tex().topBorderBuffer();
+	u16* topBorderBuffer2 = tex().topBorderBuffer2();
 	u16 *bgSubBuffer = tex().beginBgSubModify();
 	u16* bgSubBuffer2 = tex().bgSubBuffer2();
 
+	tex().clearTopGuiMask(24, 24, 208, 156); // The photo covers any GUI there
 	// Fill area with black
 	for (int y = 24; y < 180; y++) {
+		dmaFillHalfWords(0x8000, topBorderBuffer + (y * 256) + 24, 208 * 2);
 		dmaFillHalfWords(0x8000, bgSubBuffer + (y * 256) + 24, 208 * 2);
 		if (boxArtColorDeband) {
+			dmaFillHalfWords(0x8000, topBorderBuffer2 + (y * 256) + 24, 208 * 2);
 			dmaFillHalfWords(0x8000, bgSubBuffer2 + (y * 256) + 24, 208 * 2);
 		}
 	}
 
 	// Start loading
-	u16 *src = tex().photoBuffer();
-	u16 *src2 = tex().photoBuffer2();
 	uint startX = 24 + (208 - photoWidth) / 2;
-	uint y = 24 + ((156 - photoHeight) / 2);
-	uint x = startX;
-	for (uint i = 0; i < photoWidth * photoHeight; i++) {
-		if (x >= startX + photoWidth) {
-			x = startX;
-			y++;
+	for (int b = 0; b < boxArtColorDeband+1; b++) {
+		uint y = 24 + ((156 - photoHeight) / 2);
+		uint x = startX;
+		for (uint i=0;i<image.size()/4;i++) {
+			if (x >= startX + photoWidth) {
+				x = startX;
+				y++;
+			}
+
+			const u8 oldR = image[(i*4)];
+			const u8 oldG = image[(i*4)+1];
+			const u8 oldB = image[(i*4)+2];
+			const u8 oldAlpha = image[(i*4)+3];
+			u8 newR = oldR;
+			u8 newG = oldG;
+			u8 newB = oldB;
+			u8 newAlpha = oldAlpha;
+			if (alternatePixel) {
+				if (oldR >= 4 && oldR < 0xFC) newR += 4;
+				if (oldG >= 4 && oldG < 0xFC) newG += 4;
+				if (oldB >= 4 && oldB < 0xFC) newB += 4;
+				if (oldAlpha >= 4 && oldAlpha < 0xFC) newAlpha += 4;
+			}
+			if (alternatePixel2 && boxArtColorDeband) {
+				if (oldR >= 2 && newR < 0xFE) newR += 2;
+				if (oldG >= 2 && newG < 0xFE) newG += 2;
+				if (oldB >= 2 && newB < 0xFE) newB += 2;
+				if (oldAlpha >= 2 && newAlpha < 0xFE) newAlpha += 2;
+			}
+			const u16 color = newR>>3 | (newG>>3)<<5 | (newB>>3)<<10 | BIT(15);
+			if (b == 0) {
+				u16* dst = topBorderBuffer+(y * 256 + x);
+				if (oldAlpha == 255) {
+					*dst = color;
+				} else {
+					*dst = alphablend(color, 0, newAlpha);
+				}
+				if (colorTable) {
+					*dst = colorTable[*dst % 0x8000] | BIT(15);
+				}
+				bgSubBuffer[y * 256 + x] = *dst;
+			} else if (boxArtColorDeband) {
+				u16* dst = topBorderBuffer2+(y * 256 + x);
+				if (oldAlpha == 255) {
+					*dst = color;
+				} else {
+					*dst = alphablend(color, 0, newAlpha);
+				}
+				if (colorTable) {
+					*dst = colorTable[*dst % 0x8000] | BIT(15);
+				}
+				bgSubBuffer2[y * 256 + x] = *dst;
+			}
+			if ((i % photoWidth) == photoWidth-1) {
+				alternatePixel = !alternatePixel;
+				alternatePixel2 = !alternatePixel2;
+			}
+			alternatePixel = !alternatePixel;
+			alternatePixel2 = !alternatePixel2;
+			x++;
 		}
-		bgSubBuffer[y * 256 + x] = *(src++);
-		if (boxArtColorDeband) {
-			bgSubBuffer2[y * 256 + x] = *(src2++);
-		}
-		x++;
+		alternatePixel = !alternatePixel;
 	}
+
 	tex().commitBgSubModify();
 }
 
-void loadBootstrapScreenshot(FILE *file, const bool bufferOnly) {
+void loadBootstrapScreenshot(FILE *file) {
 	// Simple check to ensure we're seeked to a BMP
 	if (fgetc(file) != 'B' || fgetc(file) != 'M')
 		return;
@@ -1502,13 +1831,19 @@ void loadBootstrapScreenshot(FILE *file, const bool bufferOnly) {
 	u16 *buffer = new u16[256 * 192];
 	fread(buffer, 2, 256 * 192, file);
 
+	u16* topBorderBuffer = tex().topBorderBuffer();
+	u16* topBorderBuffer2 = tex().topBorderBuffer2();
 	u16 *bgSubBuffer = tex().beginBgSubModify();
 	u16* bgSubBuffer2 = tex().bgSubBuffer2();
 
-	if (!bufferOnly) {
-		// Fill area with black
-		for (int y = 24; y < 180; y++) {
-			dmaFillHalfWords(0x8000, bgSubBuffer + (y * 256) + 24, 208 * 2);
+	tex().clearTopGuiMask(24, 24, 208, 156); // The photo covers any GUI there
+	// Fill area with black
+	for (int y = 24; y < 180; y++) {
+		dmaFillHalfWords(0x8000, topBorderBuffer + (y * 256) + 24, 208 * 2);
+		dmaFillHalfWords(0x8000, bgSubBuffer + (y * 256) + 24, 208 * 2);
+		if (boxArtColorDeband) {
+			dmaFillHalfWords(0x8000, topBorderBuffer2 + (y * 256) + 24, 208 * 2);
+			dmaFillHalfWords(0x8000, bgSubBuffer2 + (y * 256) + 24, 208 * 2);
 		}
 	}
 
@@ -1524,21 +1859,15 @@ void loadBootstrapScreenshot(FILE *file, const bool bufferOnly) {
 			} */
 
 			u8 y = photoHeight - row - 1;
-			if (!bufferOnly) {
-				bgSubBuffer[(24 + y) * 256 + 24 + col] = val;
-			}
-			tex().photoBuffer()[y * photoWidth + col] = val;
+			topBorderBuffer[(24 + y) * 256 + 24 + col] = val;
+			bgSubBuffer[(24 + y) * 256 + 24 + col] = val;
 			if (boxArtColorDeband) {
-				if (!bufferOnly) {
-					bgSubBuffer2[(24 + y) * 256 + 24 + col] = val;
-				}
-				tex().photoBuffer2()[y * photoWidth + col] = val;
+				topBorderBuffer2[(24 + y) * 256 + 24 + col] = val;
+				bgSubBuffer2[(24 + y) * 256 + 24 + col] = val;
 			}
 		}
 	}
-	if (!bufferOnly) {
-		tex().commitBgSubModify();
-	}
+	tex().commitBgSubModify();
 
 	delete[] buffer;
 }
@@ -1580,6 +1909,9 @@ ITCM_CODE void drawCurrentTime() {
 void clearBoxArt() {
 	if (ms().macroMode) return;
 	tex().drawOverBoxArt(photoWidth, photoHeight);
+
+	extern uint boxArtWidth, boxArtHeight;
+	boxArtWidth = boxArtHeight = 0;
 }
 
 // static char videoFrameFilename[256];
@@ -1717,4 +2049,5 @@ void graphicsInit() {
 	irqSet(IRQ_VCOUNT, frameRateHandler);
 	irqEnable(IRQ_VCOUNT);
 	// consoleDemoInit();
+
 }

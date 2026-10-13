@@ -24,6 +24,7 @@
 
 #include "myDSiMode.h"
 #include "common/inifile.h"
+#include "common/logging.h"
 #include "common/tonccpy.h"
 #include "language.h"
 
@@ -33,10 +34,14 @@ bool fadeType = false;		// false = out, true = in
 bool fadeSpeed = true;		// false = slow (for DSi launch effect), true = fast
 bool controlTopBright = true;
 bool controlBottomBright = true;
-bool supportsDoubleBuffer = false;
+static bool visibleBgAndText = true;
 
 extern void ClearBrightness();
+extern bool highFPS;
 extern int imageType;
+extern bool dualScreenImage;
+extern int currentBuffer;
+extern int bufferCount;
 
 //---------------------------------------------------------------------------------
 void stop (void) {
@@ -70,7 +75,7 @@ void loadROMselect() {
 			break;
 	}
 
-	runNdsFile(argarray[0], argarray.size(), (const char**)&argarray[0], sys().isRunFromSD(), true, false, false, true, true, false, -1);
+	runNdsFile(argarray[0], argarray.size(), (const char**)&argarray[0], sys().isRunFromSD(), true, false, false, true, true, false, -1, sys().commonCache());
 
 	fadeType = true;	// Fade in from white
 }
@@ -112,11 +117,9 @@ void customSleep() {
 }
 
 void printText(void) {
-	if (ms().macroMode) return;
-
 	clearText(false);
-	if (supportsDoubleBuffer) {
-		printSmall(false, 0, 88, doubleBuffer ? STR_A_REGULAR_DITHERING : STR_A_TEMPORAL_DITHERING, Alignment::center);
+	if (supportsMultiBuffer[0] || supportsMultiBuffer[1]) {
+		printSmall(false, 0, 88, (multiBuffer[0] || multiBuffer[1]) ? STR_A_REGULAR_DITHERING : STR_A_TEMPORAL_DITHERING, Alignment::center);
 	}
 	printSmall(false, -88, 174, STR_BACK, Alignment::center);
 	updateText(false);
@@ -133,7 +136,7 @@ static void mainLoop(void) {
 	while (1) {
 		do {
 			scanKeys();
-			touchRead(&touch);
+			if (visibleBgAndText) touchRead(&touch);
 			pressed = keysDown();
 			held = keysHeld();
 			//repeat = keysDownRepeat();
@@ -147,13 +150,23 @@ static void mainLoop(void) {
 			customSleep();
 		}
 
-		if ((pressed & KEY_A) && supportsDoubleBuffer) {
-			doubleBuffer = !doubleBuffer;
-			printText();
+		if ((pressed & KEY_A) && (supportsMultiBuffer[0] || supportsMultiBuffer[1])) {
+			if (supportsMultiBuffer[0]) {
+				multiBuffer[0] = !multiBuffer[0];
+			}
+			if (supportsMultiBuffer[1]) {
+				multiBuffer[1] = !multiBuffer[1];
+			}
+			if (visibleBgAndText) printText();
 			snd().playSwitch();
 		}
 
-		if ((pressed & KEY_B) || ((pressed & KEY_TOUCH) && touch.px >= 0 && touch.px < 80 && touch.py >= 169 && touch.py < 192)) {
+		if ((pressed & KEY_Y) && (supportsMultiBuffer[0] || supportsMultiBuffer[1]) && (!multiBuffer[0] || !multiBuffer[1])) {
+			currentBuffer++;
+			if (currentBuffer == bufferCount) currentBuffer = 0;
+		}
+
+		if ((pressed & KEY_B) || (visibleBgAndText && (pressed & KEY_TOUCH) && touch.px >= 0 && touch.px < 80 && touch.py >= 169 && touch.py < 192)) {
 			loadROMselect();
 		}
 
@@ -170,7 +183,7 @@ static void mainLoop(void) {
 	mmStop();
 	*(int*)0x02003004 = 0;
 
-	runNdsFile(sys().isRunFromSD() ? "sd:/boot.nds" : "fat:/boot.nds", 0, NULL, sys().isRunFromSD(), true, true, false, true, true, false, -1);
+	runNdsFile(sys().isRunFromSD() ? "sd:/boot.nds" : "fat:/boot.nds", 0, NULL, sys().isRunFromSD(), true, true, false, true, true, false, -1, sys().commonCache());
 }
 
 //---------------------------------------------------------------------------------
@@ -179,8 +192,15 @@ int imageViewer(void) {
 	keysSetRepeat(25, 25);
 
 	ms().loadSettings();
+	logInit();
+
+	highFPS = ((sys().isRegularDS() && !sys().isDSPhat()) || ((dsiFeatures() || sdFound()) && ms().consoleModel < 2));
+	if (highFPS) {
+		bufferCount = 4;
+	}
 
 	const char* imagePathChar = ms().romPath[ms().previousUsedDevice].c_str();
+	char imagePathCharBottom[256] = {0};
 
 	if (strlen(imagePathChar) >= 2) {
 		if (extension(imagePathChar, {".gif"})) {
@@ -194,39 +214,89 @@ int imageViewer(void) {
 		imageType = 2;
 	}
 
-	graphicsInit();
-	fontInit();
-
-	langInit();
-
-	imageLoad((strlen(imagePathChar) >= 2) ? imagePathChar : "nitro:/graphics/test.png");
-	if (imageType == 0) {
-		Gif gif (imagePathChar, true, true, true);
-
-		bgLoad();
-		printText();
-
-		snd();
-		snd().beginStream();
-
-		fadeType = true;	// Fade in from white
-		for (int i = 0; i < 18; i++) {
-			swiWaitForVBlank(); // Wait until GIF appears on-screen before animating
+	if (!ms().macroMode && strlen(imagePathChar) >= 6) {
+		char imagePathChar_noExt[256] = {0};
+		sprintf(imagePathChar_noExt, imagePathChar);
+		for (int i = strlen(imagePathChar); i >= 0; i--) {
+			if (imagePathChar_noExt[i] == '.') {
+				imagePathChar_noExt[i] = 0;
+				break;
+			}
 		}
 
-		timerStart(0, ClockDivider_1024, TIMER_FREQ_1024(100), Gif::timerHandler);
+		if (imageType == 0) {
+			sprintf(imagePathCharBottom, "%s_bot.gif", imagePathChar_noExt);
+		} else if (imageType == 1) {
+			sprintf(imagePathCharBottom, "%s_bot.bmp", imagePathChar_noExt);
+		} else if (imageType == 2) {
+			sprintf(imagePathCharBottom, "%s_bot.png", imagePathChar_noExt);
+		}
 
-		mainLoop();
-
-		return 0;
+		dualScreenImage = (access(imagePathCharBottom, F_OK) == 0);
 	}
 
-	bgLoad();
-	supportsDoubleBuffer = doubleBuffer;
-	printText();
+	visibleBgAndText = (!ms().macroMode && !dualScreenImage);
+
+	graphicsInit();
+	fontInit();
+	langInit();
+
+	imageLoad((strlen(imagePathChar) >= 2) ? imagePathChar : "nitro:/graphics/test.png", false);
+	if (dualScreenImage) {
+		imageLoad(imagePathCharBottom, true);
+	}
+	if (imageType == 0) {
+		Gif gif (imagePathChar, true, true, true);
+		if (dualScreenImage) {
+			Gif gif (imagePathCharBottom, false, true, true);
+
+			snd();
+			snd().beginStream();
+
+			fadeType = true;	// Fade in from white
+			for (int i = 0; i < 18; i++) {
+				swiWaitForVBlank(); // Wait until GIF appears on-screen before animating
+			}
+
+			timerStart(0, ClockDivider_1024, TIMER_FREQ_1024(100), Gif::timerHandler);
+
+			mainLoop();
+
+			return 0;
+		} else {
+			if (visibleBgAndText) {
+				bgLoad();
+				printText();
+			}
+
+			snd();
+			snd().beginStream();
+
+			fadeType = true;	// Fade in from white
+			for (int i = 0; i < 18; i++) {
+				swiWaitForVBlank(); // Wait until GIF appears on-screen before animating
+			}
+
+			timerStart(0, ClockDivider_1024, TIMER_FREQ_1024(100), Gif::timerHandler);
+
+			mainLoop();
+
+			return 0;
+		}
+	}
+
+	if (visibleBgAndText) {
+		bgLoad();
+		printText();
+	}
 
 	snd();
 	snd().beginStream();
+
+	if (highFPS) {
+		*(u32*)(0x2FFFD0C) = 0x43535046;
+		swiWaitForVBlank();
+	}
 
 	fadeType = true;	// Fade in from white
 	mainLoop();

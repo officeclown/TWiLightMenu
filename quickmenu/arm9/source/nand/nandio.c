@@ -13,6 +13,7 @@
 #define CRYPT_BUF_LEN 64
 
 extern vu32* sharedAddr;
+// extern bool my_sdio_isNoSGba;
 
 static bool is3DS;
 
@@ -30,7 +31,14 @@ void nandio_set_fat_sig_fix(u32 offset) {
 }
 
 void getConsoleID(u8 *consoleID){
-	u8 *fifo=(u8*)0x02F00000; //shared mem address that has our computed key3 stuff
+	u8 *fifo=(u8*)crypt_buf; //shared mem address that has our computed key3 stuff
+	DC_InvalidateRange(fifo, 0x400);
+	*(u32*)(0xCFFFD08) = (u32)fifo;
+	*(u32*)(0xCFFFD0C) = 0x44494347; // 'GCID'
+	while (*(u32*)(0xCFFFD0C) != 0) {
+		swiDelay(100);
+	}
+
 	u8 key[16]; //key3 normalkey - keyslot 3 is used for DSi/twln NAND crypto
 	u8 key_xy[16]; //key3_y ^ key3_x
 	u8 key_x[16];////key3_x - contains a DSi console id (which just happens to be the LFCS on 3ds)
@@ -57,10 +65,25 @@ bool my_nand_ReadSectors(sec_t sector, sec_t numSectors,void* buffer) {
 	sharedAddr[1] = numSectors;
 	sharedAddr[2] = (vu32)buffer;
 	
-	sharedAddr[3] = 0x4452414E;
-	IPC_SendSync(6);
+	sharedAddr[3] = 0x4452414E; // 'NARD'
+	// if (my_sdio_isNoSGba) {
+		IPC_SendSync(6);
+	/* } else {
+		fifoSendValue32(FIFO_SDMMC, 6);
+	} */
 	while (sharedAddr[3] == 0x4452414E) {
 		swiDelay(100);
+	}
+	while (1) {
+		if (sharedAddr[3] == 0x474E4950) { // 'PING'
+			sharedAddr[3] = 0x5243414E; // 'NACR'
+			IPC_SendSync(4);
+			while (sharedAddr[3] == 0x5243414E) {
+				swiDelay(100);
+			}
+		} else {
+			break;
+		}
 	}
 
 	int result = sharedAddr[3];
@@ -72,7 +95,11 @@ bool nandio_startup() {
 	int result = 0;
 
 	sharedAddr[3] = 0x56484453;
-	IPC_SendSync(0);
+	// if (my_sdio_isNoSGba) {
+		IPC_SendSync(1);
+	/* } else {
+		fifoSendValue32(FIFO_SDMMC, 1);
+	} */
 	while (sharedAddr[3] == 0x56484453) {
 		swiDelay(100);
 	}
@@ -81,7 +108,11 @@ bool nandio_startup() {
 	if (result==0) return false;
 
 	sharedAddr[3] = 0x5453414E;
-	IPC_SendSync(2);
+	// if (my_sdio_isNoSGba) {
+		IPC_SendSync(2);
+	/* } else {
+		fifoSendValue32(FIFO_SDMMC, 2);
+	} */
 	while (sharedAddr[3] == 0x5453414E) {
 		swiDelay(100);
 	}
@@ -92,7 +123,6 @@ bool nandio_startup() {
 
 	my_nand_ReadSectors(0, 1, sector_buf);
 	is3DS = parse_ncsd(sector_buf, 0) == 0;
-	if (is3DS) return false;
 
 	if (*(u32*)(0x2FFD7BC) == 0) {
 		// Get eMMC CID

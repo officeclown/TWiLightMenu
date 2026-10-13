@@ -11,12 +11,13 @@ jobs:
     name: Build with Docker using devkitARM
     steps:
       - name: Checkout repo
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           submodules: recursive
           fetch-depth: 0
       - name: Install tools
         run: |
+          sudo sed -i "/bullseye-security/d" /etc/apt/sources.list
           sudo apt-get update
           sudo apt-get install jq p7zip-full python -y
       - name: Setup environment
@@ -58,6 +59,7 @@ jobs:
           mkdir -p 7zfile/_nds/TWiLightMenu/extras/fonts/
           mkdir -p 7zfile/_nds/TWiLightMenu/gamesettings/
           mkdir -p 7zfile/_nds/TWiLightMenu/r4menu/themes/
+          mkdir -p 7zfile/DSi\&3DS\ -\ SD\ card\ users/_nds/
 
           # nds-bootstrap
           mkdir -p nds-bootstrap
@@ -82,6 +84,8 @@ jobs:
           # DSi 7z
           cp -r DSi\ -\ CFW\ users/SDNAND\ root/* .
           rm -rf DSi\ -\ CFW\ users
+          cp -r DSi\ -\ SD\ card\ users/* .
+          rm -rf DSi\ -\ SD\ card\ users
           cp -r DSi\&3DS\ -\ SD\ card\ users/* .
           rm -rf DSi\&3DS\ -\ SD\ card\ users
           rm -rf 3DS\ -\ CFW\ users
@@ -89,7 +93,9 @@ jobs:
           rm -rf Better\ DSi\ Menu\ Music
           rm -rf Extra\ UI\ Music
           rm -rf Multimedia
-          rm -rf Virtual\ Console
+          rm -rf "Virtual Console (DSi or Flashcard)"
+          rm -rf "Virtual Console (3DS, Minimal)"
+          rm -rf "Virtual Console (3DS, Full)"
           rm -rf _nds/GBARunner2_arm7dldi_3ds.nds
           rm -rf _nds/GBARunner2_arm7dldi_nodsp_3ds.nds
           rm -rf _nds/TWiLightMenu/bootplg.srldr
@@ -104,6 +110,7 @@ jobs:
           cd TWiLightMenu
           cp -r 3DS\ -\ CFW\ users/* .
           rm -rf 3DS\ -\ CFW\ users
+          rm -rf DSi\ -\ SD\ card\ users
           cp -r DSi\&3DS\ -\ SD\ card\ users/* .
           rm -rf DSi\&3DS\ -\ SD\ card\ users
           rm -rf DSi\ -\ CFW\ users
@@ -111,10 +118,11 @@ jobs:
           rm -rf Better\ DSi\ Menu\ Music
           rm -rf Extra\ UI\ Music
           rm -rf Multimedia
-          rm -rf Virtual\ Console
+          rm -rf "Virtual Console (DSi or Flashcard)"
+          rm -rf "Virtual Console (3DS, Minimal)"
+          rm -rf "Virtual Console (3DS, Full)"
           rm -rf _nds/GBARunner2_arm7dldi_dsi.nds
           rm -rf _nds/GBARunner2_arm7dldi_nodsp_dsi.nds
-          rm -rf _nds/TWiLightMenu/unlaunch
           rm -rf _nds/TWiLightMenu/bootplg.srldr
           rm -rf _nds/TWiLightMenu/gbaswitch.srldr
           rm -rf ntrboot.nds
@@ -129,19 +137,22 @@ jobs:
           cp -r Flashcard\ users/* .
           rm -rf Flashcard\ users
           rm -rf 3DS\ -\ CFW\ users
+          rm -rf DSi\ -\ SD\ card\ users
           rm -rf DSi\&3DS\ -\ SD\ card\ users
           rm -rf DSi\ -\ CFW\ users
           rm -rf Better\ DSi\ Menu\ Music
           rm -rf Extra\ UI\ Music
           rm -rf Multimedia
-          rm -rf Virtual\ Console
+          rm -rf "Virtual Console (DSi or Flashcard)"
+          rm -rf "Virtual Console (3DS, Minimal)"
+          rm -rf "Virtual Console (3DS, Full)"
           7z a TWiLightMenu-Flashcard.7z
           mv TWiLightMenu-Flashcard.7z ~/artifacts
 
-          # Virtual Console Add-on 7z
+          # Virtual Console Add-on (DSi or Flashcard) 7z
           cd ..
           rm -rf TWiLightMenu
-          cp -r 7zfile/Virtual\ Console/ TWiLightMenu
+          cp -r "7zfile/Virtual Console (DSi or Flashcard)/" TWiLightMenu
           cd TWiLightMenu/_nds/TWiLightMenu/emulators
           curl -LO https://github.com/wavemotion-dave/A8DS/releases/latest/download/A8DS.nds
           curl -LO https://github.com/wavemotion-dave/StellaDS/releases/latest/download/StellaDS.nds
@@ -170,8 +181,72 @@ jobs:
           curl -LO $(curl https://api.github.com/repos/DS-Homebrew/PicoDriveTWL/releases | jq --raw-output '.[0].assets[0].browser_download_url' -)
           curl -LO https://github.com/DS-Homebrew/PokeMini/releases/latest/download/PokeMini.nds
           cd ../../..
-          7z a -md=16m AddOn-VirtualConsole.7z
-          mv AddOn-VirtualConsole.7z ~/artifacts
+          7z a -md=16m AddOn-VirtualConsole-DSi-or-Flashcard.7z
+          mv AddOn-VirtualConsole-DSi-or-Flashcard.7z ~/artifacts
+
+          # Virtual Console Add-on (3DS, Minimal) 7z
+          cd ..
+          rm -rf TWiLightMenu
+          cp -r "7zfile/Virtual Console (3DS, Minimal)/" TWiLightMenu
+          cd TWiLightMenu/_nds/TWiLightMenu
+          mkdir -p emulators
+          cd emulators
+          curl -LO https://github.com/wavemotion-dave/A8DS/releases/latest/download/A8DS.nds
+          curl -LO https://github.com/wavemotion-dave/StellaDS/releases/latest/download/StellaDS.nds
+          curl -LO https://github.com/wavemotion-dave/A5200DS/releases/latest/download/A5200DS.nds
+          curl -LO https://github.com/wavemotion-dave/A5200DS/releases/latest/download/A5200DSi.nds
+          curl -LO https://github.com/wavemotion-dave/A7800DS/releases/latest/download/A7800DS.nds
+          curl -LO https://github.com/wavemotion-dave/NINTV-DS/releases/latest/download/NINTV-DS.nds
+          curl -LO https://github.com/wavemotion-dave/ColecoDS/releases/latest/download/ColecoDS.nds
+          curl -LO https://github.com/wavemotion-dave/SugarDS/releases/latest/download/SugarDS.nds
+          curl -LO https://github.com/FluBBaOfWard/S8DS/releases/latest/download/S8DS.zip
+          7z x S8DS.zip S8DS.nds
+          rm S8DS.zip
+          curl -LO https://github.com/FluBBaOfWard/NGPDS/releases/latest/download/NGPDS.zip
+          7z x NGPDS.zip NGPDS.nds
+          rm NGPDS.zip
+          curl -LO https://github.com/FluBBaOfWard/NitroSwan/releases/latest/download/NitroSwan.zip
+          7z x NitroSwan.zip NitroSwan.nds
+          rm NitroSwan.zip
+          curl -LO https://github.com/DS-Homebrew/PokeMini/releases/latest/download/PokeMini.nds
+          cd ../../..
+          7z a -md=16m AddOn-VirtualConsole-3DS-Minimal.7z
+          mv AddOn-VirtualConsole-3DS-Minimal.7z ~/artifacts
+
+          # Virtual Console Add-on (3DS, Full) 7z
+          cd ..
+          rm -rf TWiLightMenu
+          cp -r "7zfile/Virtual Console (3DS, Full)/" TWiLightMenu
+          cd TWiLightMenu/_nds/TWiLightMenu/emulators
+          curl -LO https://github.com/wavemotion-dave/A8DS/releases/latest/download/A8DS.nds
+          curl -LO https://github.com/wavemotion-dave/StellaDS/releases/latest/download/StellaDS.nds
+          curl -LO https://github.com/wavemotion-dave/A5200DS/releases/latest/download/A5200DS.nds
+          curl -LO https://github.com/wavemotion-dave/A5200DS/releases/latest/download/A5200DSi.nds
+          curl -LO https://github.com/wavemotion-dave/A7800DS/releases/latest/download/A7800DS.nds
+          curl -LO https://github.com/wavemotion-dave/NINTV-DS/releases/latest/download/NINTV-DS.nds
+          curl -LO https://github.com/wavemotion-dave/ColecoDS/releases/latest/download/ColecoDS.nds
+          curl -LO https://github.com/wavemotion-dave/SugarDS/releases/latest/download/SugarDS.nds
+          curl -LO https://github.com/cotodevel/snemulds/raw/33f5f469b6e6c19cb3e1be9259b407832fce42b9/release/arm7dldi-ntr/SNEmulDS.nds
+          curl -LO https://github.com/cotodevel/snemulds/raw/33f5f469b6e6c19cb3e1be9259b407832fce42b9/release/arm7dldi-twl/SNEmulDS.srl
+          curl -LO https://github.com/DS-Homebrew/NesDS/releases/latest/download/nesDS.nds
+          curl -LO https://github.com/FluBBaOfWard/S8DS/releases/latest/download/S8DS.zip
+          7z x S8DS.zip S8DS.nds
+          rm S8DS.zip
+          curl -LO https://github.com/FluBBaOfWard/NGPDS/releases/latest/download/NGPDS.zip
+          7z x NGPDS.zip NGPDS.nds
+          rm NGPDS.zip
+          curl -LO https://github.com/FluBBaOfWard/NitroGrafx/releases/latest/download/NitroGrafx0_9_0.zip
+          7z x NitroGrafx0_9_0.zip NitroGrafx.nds
+          rm NitroGrafx0_9_0.zip
+          curl -LO https://github.com/FluBBaOfWard/NitroSwan/releases/latest/download/NitroSwan.zip
+          7z x NitroSwan.zip NitroSwan.nds
+          rm NitroSwan.zip
+          # PicoDriveTWL is a prerelease, so get the latest URL from the GH api
+          curl -LO $(curl https://api.github.com/repos/DS-Homebrew/PicoDriveTWL/releases | jq --raw-output '.[0].assets[0].browser_download_url' -)
+          curl -LO https://github.com/DS-Homebrew/PokeMini/releases/latest/download/PokeMini.nds
+          cd ../../..
+          7z a -md=16m AddOn-VirtualConsole-3DS-Full.7z
+          mv AddOn-VirtualConsole-3DS-Full.7z ~/artifacts
 
           # Multimedia Add-on 7z
           cd ..
@@ -202,7 +277,7 @@ jobs:
           mv AddOn-ExtraUIMusic.7z ~/artifacts
 
       - name: Publish build to GH Actions
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           path: ~/artifacts/*
           name: build
@@ -215,7 +290,7 @@ jobs:
     needs: build
     steps:
       - name: Download artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: build
           path: build

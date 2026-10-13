@@ -24,11 +24,13 @@
 #include "bios_decompress_callback.h"
 #include "common/twlmenusettings.h"
 #include "common/systemdetails.h"
+#include "common/flashcard.h"
 #include "common/gl2d.h"
 #include "common/tonccpy.h"
 #include "graphics.h"
 // #include "common/ColorLut.h"
 #include "common/lodepng.h"
+#include "myDSiMode.h"
 
 #define CONSOLE_SCREEN_WIDTH 32
 #define CONSOLE_SCREEN_HEIGHT 24
@@ -43,12 +45,14 @@ bool twlMenuSplash = false;
 extern void twlMenuVideo_loadTopGraphics(void);
 extern void twlMenuVideo_topGraphicRender(void);
 
-bool doubleBuffer = false;
-bool doubleBufferTop = true;
-bool secondBuffer = false;
+bool highFPS = false;
+bool multiBuffer = false;
+bool multiBufferTop = true;
+static int currentBuffer = 0;
+int bufferCount = 2;
 
-u16 frameBuffer[2][256*192];
-u16 frameBufferBot[2][256*192];
+u16* frameBuffer[4];
+u16* frameBufferBot[4];
 u16* colorTable = NULL;
 bool invertedColors = false;
 bool noWhiteFade = false;
@@ -96,16 +100,30 @@ void vBlankHandler() {
 	}
 	if (controlTopBright) SetBrightness(0, fadeColor ? screenBrightness : -screenBrightness);
 	if (controlBottomBright && !ms().macroMode) SetBrightness(1, fadeColor ? screenBrightness : -screenBrightness);
-	if (doubleBuffer) {
-		if (doubleBufferTop) {
-			dmaCopyWordsAsynch(0, frameBuffer[secondBuffer], BG_GFX, 0x18000);
+	if (twlMenuSplash) {
+		twlMenuVideo_topGraphicRender();
+	}
+	if (multiBuffer) {
+		if (multiBufferTop) {
+			dmaCopyWordsAsynch(0, frameBuffer[currentBuffer], BG_GFX, 0x18000);
 		}
-		dmaCopyWordsAsynch(1, frameBufferBot[secondBuffer], BG_GFX_SUB, 0x18000);
-		secondBuffer = !secondBuffer;
+		dmaCopyWordsAsynch(1, frameBufferBot[currentBuffer], BG_GFX_SUB, 0x18000);
+		currentBuffer++;
+		if (currentBuffer == bufferCount) currentBuffer = 0;
 	}
 }
 
 void LoadBMP(void) {
+	highFPS = ((sys().isRegularDS() && !sys().isDSPhat()) || ((dsiFeatures() || sdFound()) && ms().consoleModel < 2));
+	if (highFPS) {
+		bufferCount = 4;
+	}
+
+	for (int i = 0; i < bufferCount; i++) {
+		frameBuffer[i] = new u16[256*192];
+		frameBufferBot[i] = new u16[256*192];
+	}
+
 	dmaFillHalfWords(0, BG_GFX, 0x18000);
 	dmaFillHalfWords(0, BG_GFX_SUB, 0x18000);
 
@@ -114,76 +132,76 @@ void LoadBMP(void) {
 
 	lodepng::decode(image, width, height, ms().rocketRobzLogo ? (sys().isDSPhat() ? "nitro:/graphics/logoPhat_rocketrobz.png" : "nitro:/graphics/logo_rocketrobz.png") : "nitro:/graphics/logo_rocketrobzHide.png");
 	bool alternatePixel = false;
-	for (unsigned i=0;i<image.size()/4;i++) {
-		image[(i*4)+3] = 0;
-		if (alternatePixel) {
-			if (image[(i*4)] >= 0x4 && image[(i*4)] < 0xFC) {
-				image[(i*4)] += 0x4;
-				image[(i*4)+3] |= BIT(0);
+	bool alternatePixel2 = false;
+	bool alternatePixel3 = false;
+	for (int b = 0; b < bufferCount; b++) {
+		for (unsigned i=0;i<image.size()/4;i++) {
+			const u8 oldR = image[(i*4)];
+			const u8 oldG = image[(i*4)+1];
+			const u8 oldB = image[(i*4)+2];
+			u8 newR = oldR;
+			u8 newG = oldG;
+			u8 newB = oldB;
+			if (alternatePixel) {
+				if (oldR >= 4 && oldR < 0xFC) newR += 4;
+				if (oldG >= 4 && oldG < 0xFC) newG += 4;
+				if (oldB >= 4 && oldB < 0xFC) newB += 4;
 			}
-			if (image[(i*4)+1] >= 0x4 && image[(i*4)+1] < 0xFC) {
-				image[(i*4)+1] += 0x4;
-				image[(i*4)+3] |= BIT(1);
+			if (alternatePixel2) {
+				if (oldR >= 2 && newR < 0xFE) newR += 2;
+				if (oldG >= 2 && newG < 0xFE) newG += 2;
+				if (oldB >= 2 && newB < 0xFE) newB += 2;
 			}
-			if (image[(i*4)+2] >= 0x4 && image[(i*4)+2] < 0xFC) {
-				image[(i*4)+2] += 0x4;
-				image[(i*4)+3] |= BIT(2);
+			if (alternatePixel3) {
+				if (oldR >= 1 && newR < 0xFF) newR++;
+				if (oldG >= 1 && newG < 0xFF) newG++;
+				if (oldB >= 1 && newB < 0xFF) newB++;
 			}
+			u16 color = newR>>3 | (newG>>3)<<5 | (newB>>3)<<10 | BIT(15);
+			if (ms().macroMode) {
+				frameBuffer[b][i] = color;
+			} else {
+				frameBufferBot[b][i] = color;
+			}
+			if ((i % 256) == 255) {
+				alternatePixel = !alternatePixel;
+				alternatePixel2 = !alternatePixel2;
+			}
+			alternatePixel = !alternatePixel;
+			alternatePixel2 = !alternatePixel2;
 		}
-		u16 color = image[i*4]>>3 | (image[(i*4)+1]>>3)<<5 | (image[(i*4)+2]>>3)<<10 | BIT(15);
-		if (ms().macroMode) {
-			frameBuffer[0][i] = color;
-		} else {
-			frameBufferBot[0][i] = color;
-		}
-		if (alternatePixel) {
-			if (image[(i*4)+3] & BIT(0)) {
-				image[(i*4)] -= 0x4;
-			}
-			if (image[(i*4)+3] & BIT(1)) {
-				image[(i*4)+1] -= 0x4;
-			}
-			if (image[(i*4)+3] & BIT(2)) {
-				image[(i*4)+2] -= 0x4;
-			}
-		} else {
-			if (image[(i*4)] >= 0x4 && image[(i*4)] < 0xFC) {
-				image[(i*4)] += 0x4;
-			}
-			if (image[(i*4)+1] >= 0x4 && image[(i*4)+1] < 0xFC) {
-				image[(i*4)+1] += 0x4;
-			}
-			if (image[(i*4)+2] >= 0x4 && image[(i*4)+2] < 0xFC) {
-				image[(i*4)+2] += 0x4;
-			}
-		}
-		color = image[i*4]>>3 | (image[(i*4)+1]>>3)<<5 | (image[(i*4)+2]>>3)<<10 | BIT(15);
-		if (ms().macroMode) {
-			frameBuffer[1][i] = color;
-		} else {
-			frameBufferBot[1][i] = color;
-		}
-		if ((i % 256) == 255) alternatePixel = !alternatePixel;
 		alternatePixel = !alternatePixel;
+		if (b == 1) {
+			alternatePixel2 = !alternatePixel2;
+		}
+		if (highFPS) {
+			alternatePixel3 = !alternatePixel3;
+		}
 	}
 	image.clear();
 	if (colorTable) {
 		if (ms().macroMode) {
-			for (int i=0; i<256*192; i++) {
-				frameBuffer[0][i] = colorTable[frameBuffer[0][i] % 0x8000] | BIT(15);
-				frameBuffer[1][i] = colorTable[frameBuffer[1][i] % 0x8000] | BIT(15);
+			for (int b = 0; b < bufferCount; b++) {
+				for (int i=0; i<256*192; i++) {
+					frameBuffer[b][i] = colorTable[frameBuffer[b][i] % 0x8000] | BIT(15);
+				}
 			}
 		} else {
-			for (int i=0; i<256*192; i++) {
-				frameBufferBot[0][i] = colorTable[frameBufferBot[0][i] % 0x8000] | BIT(15);
-				frameBufferBot[1][i] = colorTable[frameBufferBot[1][i] % 0x8000] | BIT(15);
+			for (int b = 0; b < bufferCount; b++) {
+				for (int i=0; i<256*192; i++) {
+					frameBufferBot[b][i] = colorTable[frameBufferBot[b][i] % 0x8000] | BIT(15);
+				}
 			}
 		}
 	}
-	doubleBuffer = true;
+	multiBuffer = true;
 	if (ms().macroMode) {
+		if (highFPS) {
+			*(u32*)(0x2FFFD0C) = 0x43535046;
+			swiWaitForVBlank();
+		}
 		fadeType = true;
-		for (int i = 0; i < 60 * 3; i++) {
+		for (int i = 0; i < (highFPS ? 72 : 60) * 3; i++) {
 			scanKeys();
 			if ((keysHeld() & KEY_START) || (keysHeld() & KEY_SELECT) || (keysHeld() & KEY_TOUCH)) break;
 			swiWaitForVBlank();
@@ -192,12 +210,12 @@ void LoadBMP(void) {
 		for (int i = 0; i < 25; i++) {
 			swiWaitForVBlank();
 		}
-		doubleBuffer = false;
+		multiBuffer = false;
 		swiWaitForVBlank();
 		dmaFillHalfWords(0, BG_GFX, 0x18000);
 	}
 
-	doubleBufferTop = false;
+	multiBufferTop = false;
 }
 
 static bool graphicIrqRunning = false;
@@ -260,7 +278,7 @@ void loadTitleGraphics() {
 	toncset16(BG_PALETTE, 0, 256);
 	toncset16(BG_PALETTE_SUB, 0, 256);
 
-	// Display TWiLightMenu++ logo
+	// Display Rocket Robz logo
 	LoadBMP();
 
 	twlMenuVideo_loadTopGraphics();

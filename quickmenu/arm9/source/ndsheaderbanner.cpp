@@ -4,6 +4,7 @@
 #include <unistd.h>
 #include <gl2d.h>
 
+#include "common/dsiBanner.h"
 #include "ndsheaderbanner.h"
 #include "module_params.h"
 
@@ -117,11 +118,15 @@ bool isDirectory[2]{false, false};
 eROMType bnrRomType[2]{};
 bool bnriconisDSi[2]{false, false};
 int bnrWirelessIcon[2]{}; 			// 0 = None, 1 = Local, 2 = WiFi
+bool isNdz[2]{false, false};
 bool isDSiWare[2]{false, false};
 bool isHomebrew[2]{false, false};
 bool isModernHomebrew[2]{false, false};		// false == No DSi-Extended header, true == Has DSi-Extended header
 int customIcon[2]{};				// 0 = None, 1 = png, 2 = banner.bin, -1 = error
 char customIconPath[256];
+
+static u16 bannerDelayNum[2] = {0x0000};
+int currentbnriconframeseq[2] = {0};
 
 /**
  * Get banner sequence from banner file.
@@ -132,6 +137,8 @@ void grabBannerSequence(int num)
 	for (int i = 0; i < 64; i++) {
 		bnriconframeseq[num][i] = ndsBanner.dsi_seq[i];
 	}
+	bannerDelayNum[num] = 0;
+	currentbnriconframeseq[num] = 0;
 }
 
 /**
@@ -142,10 +149,9 @@ void clearBannerSequence(int num)
 	for (int i = 0; i < 64; i++) {
 		bnriconframeseq[num][i] = 0x0000;
 	}
+	bannerDelayNum[num] = 0;
+	currentbnriconframeseq[num] = 0;
 }
-
-static u16 bannerDelayNum[2] = {0x0000};
-int currentbnriconframeseq[2] = {0};
 
 /**
  * Play banner sequence.
@@ -153,56 +159,45 @@ int currentbnriconframeseq[2] = {0};
  */
 bool playBannerSequence(int num)
 {
-	if (bnriconframeseq[num][currentbnriconframeseq[num] + 1] == 0x0100) {
+	DsiBannerFrame frame;
+
+	if (!dsiBannerSeqStep(bnriconframeseq[num], &currentbnriconframeseq[num], &bannerDelayNum[num], &frame)) {
 		// Do nothing if icon isn't animated
 		bnriconPalLine[num] = 0;
 		bnriconframenumY[num] = 0;
 		bannerFlip[num] = GL_FLIP_NONE;
-	} else {
-		u16 setframeseq = bnriconframeseq[num][currentbnriconframeseq[num]];
-		bnriconPalLine[num] = SEQ_PAL(setframeseq);
-		bnriconframenumY[num] =  SEQ_BMP(setframeseq);
-		bool flipH = SEQ_FLIPH(setframeseq);
-		bool flipV = SEQ_FLIPV(setframeseq);
-
-		if (flipH && flipV) {
-			bannerFlip[num] = GL_FLIP_H | GL_FLIP_V;
-		} else if (!flipH && !flipV) {
-			bannerFlip[num] = GL_FLIP_NONE;
-		} else if (flipH && !flipV) {
-			bannerFlip[num] = GL_FLIP_H;
-		} else if (!flipH && flipV) {
-			bannerFlip[num] = GL_FLIP_V;
-		}
-
-		bool updateIcon = false;
-
-		if (bnriconPalLinePrev[num] != bnriconPalLine[num]) {
-			bnriconPalLinePrev[num] = bnriconPalLine[num];
-			updateIcon = true;
-		}
-
-		if (bnriconframenumYPrev[num] != bnriconframenumY[num]) {
-			bnriconframenumYPrev[num] = bnriconframenumY[num];
-			updateIcon = true;
-		}
-
-		if (bannerFlipPrev[num] != bannerFlip[num]) {
-			bannerFlipPrev[num] = bannerFlip[num];
-			updateIcon = true;
-		}
-
-		bannerDelayNum[num]++;
-		if (bannerDelayNum[num] >= (setframeseq & 0x00FF)) {
-			bannerDelayNum[num] = 0x0000;
-			currentbnriconframeseq[num]++;
-			if (bnriconframeseq[num][currentbnriconframeseq[num]] == 0x0000) {
-				currentbnriconframeseq[num] = 0; // Reset sequence
-			}
-		}
-
-		return updateIcon;
+		return false;
 	}
 
-	return false;
+	bnriconPalLine[num] = frame.pltt;
+	bnriconframenumY[num] = frame.cell;
+
+	if (frame.flipH && frame.flipV) {
+		bannerFlip[num] = GL_FLIP_H | GL_FLIP_V;
+	} else if (!frame.flipH && !frame.flipV) {
+		bannerFlip[num] = GL_FLIP_NONE;
+	} else if (frame.flipH && !frame.flipV) {
+		bannerFlip[num] = GL_FLIP_H;
+	} else {
+		bannerFlip[num] = GL_FLIP_V;
+	}
+
+	bool updateIcon = false;
+
+	if (bnriconPalLinePrev[num] != bnriconPalLine[num]) {
+		bnriconPalLinePrev[num] = bnriconPalLine[num];
+		updateIcon = true;
+	}
+
+	if (bnriconframenumYPrev[num] != bnriconframenumY[num]) {
+		bnriconframenumYPrev[num] = bnriconframenumY[num];
+		updateIcon = true;
+	}
+
+	if (bannerFlipPrev[num] != bannerFlip[num]) {
+		bannerFlipPrev[num] = bannerFlip[num];
+		updateIcon = true;
+	}
+
+	return updateIcon;
 }

@@ -30,10 +30,10 @@
 #include <nds.h>
 #include <string.h>
 #include <maxmod7.h>
+#include "card_init.h"
 #include "common/isPhatCheck.h"
 #include "common/arm7status.h"
 #include "common/picoLoader7.h"
-#include "fpsAdjust.h"
 
 #define REG_SCFG_WL *(vu16*)0x4004020
 
@@ -43,8 +43,6 @@ void my_sdmmc_get_cid(int devicenumber, u32 *cid);
 
 u8 my_i2cReadRegister(u8 device, u8 reg);
 u8 my_i2cWriteRegister(u8 device, u8 reg, u8 data);
-
-static fpsa_t sActiveFpsa;
 
 #define BIT_SET(c, n) ((c) << (n))
 
@@ -73,6 +71,7 @@ void ReturntoDSiMenu() {
 //---------------------------------------------------------------------------------
 	nocashMessage("ARM7 ReturnToDSiMenu");
 	if (isDSiMode() && !i2cBricked) {
+		i2cWriteRegister(0x4A, 0x12, i2cReadRegister(0x4A, 0x12) | 1); // 3DS - is_twl - Do not trust gbatek for this register - Thanks TuxSH!
 		i2cWriteRegister(0x4A, 0x70, 0x01);		// Bootflag = Warmboot/SkipHealthSafety
 		i2cWriteRegister(0x4A, 0x11, 0x01);		// Reset to DSi Menu
 	} else {
@@ -100,6 +99,9 @@ static void resetDSPico() {
 
 static void menuValue32Handler(u32 value, void* data) {
 	switch (value) {
+		case 0x54494E49: // 'INIT'
+			fifoSendValue32(FIFO_USER_02, initFlashcardArm7());
+			break;
 		case 0x4F434950: // 'PICO'
 			reset_pico = true;
 			break;
@@ -128,137 +130,11 @@ void VblankHandler(void) {
 	REG_MASTER_VOLUME = soundVolume;
 }
 
-static void vcountIrqLower()
-{
-    while (1)
-    {
-        if (sActiveFpsa.initial)
-        {
-            sActiveFpsa.initial = FALSE;
-            break;
-        }
-
-        if (!sActiveFpsa.backJump)
-            sActiveFpsa.cycleDelta += sActiveFpsa.targetCycles - ((u64)FPSA_CYCLES_PER_FRAME << 24);
-        u32 linesToAdd = 0;
-        while (sActiveFpsa.cycleDelta >= (s64)((u64)FPSA_CYCLES_PER_LINE << 23))
-        {
-            sActiveFpsa.cycleDelta -= (u64)FPSA_CYCLES_PER_LINE << 24;
-            if (++linesToAdd == 5)
-                break;
-        }
-        if (linesToAdd == 0)
-        {
-            sActiveFpsa.backJump = FALSE;
-            break;
-        }
-        if (linesToAdd > 1)
-        {
-            sActiveFpsa.backJump = TRUE;
-        }
-        else
-        {
-            // don't set the backJump flag because the irq is not retriggered if the new vcount
-            // is the same as the previous line
-            sActiveFpsa.backJump = FALSE;
-        }
-        // ensure we won't accidentally run out of line time
-        while (REG_DISPSTAT & DISP_IN_HBLANK)
-            ;
-        int curVCount = REG_VCOUNT;
-        REG_VCOUNT = curVCount - (linesToAdd - 1);
-        if (linesToAdd == 1)
-            break;
-
-        while (REG_VCOUNT >= curVCount)//FPSA_ADJUST_MAX_VCOUNT - 5)
-            ;
-        while (REG_VCOUNT < curVCount)//FPSA_ADJUST_MAX_VCOUNT - 5)
-            ;
-    }
-    REG_IF = IRQ_VCOUNT;
-}
-
-static void vcountIrqHigher()
-{
-    if (sActiveFpsa.initial)
-    {
-        sActiveFpsa.initial = FALSE;
-        return;
-    }
-    sActiveFpsa.cycleDelta += ((u64)FPSA_CYCLES_PER_FRAME << 24) - sActiveFpsa.targetCycles;
-    u32 linesToSkip = 0;
-    while (sActiveFpsa.cycleDelta >= (s64)((u64)FPSA_CYCLES_PER_LINE << 23))
-    {
-        sActiveFpsa.cycleDelta -= (u64)FPSA_CYCLES_PER_LINE << 24;
-        if (++linesToSkip == sActiveFpsa.linesToSkipMax)
-            break;
-    }
-    if (linesToSkip == 0)
-        return;
-    // ensure we won't accidentally run out of line time
-    while (REG_DISPSTAT & DISP_IN_HBLANK)
-        ;
-    REG_VCOUNT = REG_VCOUNT + (linesToSkip + 1);
-}
-
-void fpsa_init(fpsa_t* fpsa)
-{
-    memset(fpsa, 0, sizeof(fpsa_t));
-    fpsa->isStarted = FALSE;
-    fpsa_setTargetFrameCycles(fpsa, (u64)FPSA_CYCLES_PER_FRAME << 24); // default to no adjustment
-}
-
-void fpsa_start(fpsa_t* fpsa)
-{
-    int irq = enterCriticalSection();
-    do
-    {
-        if (fpsa->isStarted)
-            break;
-        if (fpsa->targetCycles == ((u64)FPSA_CYCLES_PER_FRAME << 24))
-            break;
-        irqDisable(IRQ_VCOUNT);
-        fpsa->backJump = FALSE;
-        fpsa->cycleDelta = 0;
-        fpsa->initial = TRUE;
-        fpsa->isFpsLower = fpsa->targetCycles >= ((u64)FPSA_CYCLES_PER_FRAME << 24);
-        // prevent the irq from immediately happening
-        while (REG_VCOUNT != FPSA_ADJUST_MAX_VCOUNT + 2)
-            ;
-        fpsa->isStarted = TRUE;
-        if (fpsa->isFpsLower)
-        {
-            SetYtrigger(FPSA_ADJUST_MAX_VCOUNT - 5);
-            irqSet(IRQ_VCOUNT, vcountIrqLower);
-        }
-        else
-        {
-            SetYtrigger(FPSA_ADJUST_MIN_VCOUNT);
-            irqSet(IRQ_VCOUNT, vcountIrqHigher);
-        }
-        irqEnable(IRQ_VCOUNT);
-    } while (0);
-    leaveCriticalSection(irq);
-}
-
-void fpsa_stop(fpsa_t* fpsa)
-{
-    if (!fpsa->isStarted)
-        return;
-    fpsa->isStarted = FALSE;
-    irqDisable(IRQ_VCOUNT);
-}
-
-void fpsa_setTargetFrameCycles(fpsa_t* fpsa, u64 cycles)
-{
-    fpsa->targetCycles = cycles;
-}
-
-void fpsa_setTargetFpsFraction(fpsa_t* fpsa, u32 num, u32 den)
-{
-    u64 cycles = (((double)FPSA_SYS_CLOCK * den * (1 << 24)) / num) + 0.5;
-    fpsa_setTargetFrameCycles(fpsa, cycles);//((((u64)FPSA_SYS_CLOCK * (u64)den) << 24) + ((num + 1) >> 1)) / num);
-	fpsa->linesToSkipMax = (num / den > 62) ? 55 : 5;
+//---------------------------------------------------------------------------------
+void VcountHandler(void) {
+//---------------------------------------------------------------------------------
+	// Change FPS to 72
+	REG_VCOUNT += 44;
 }
 
 
@@ -308,7 +184,7 @@ TWL_CODE void aes(void* in, void* out, void* iv, u32 method){ //this is sort of 
 	//if (method & (AES_CTR_DECRYPT | AES_CTR_ENCRYPT)) add_ctr((u8*)iv);
 }
 
-TWL_CODE void getConsoleID(void) {
+TWL_CODE void getConsoleID(u32 offset) {
 	// Fix duplicated line bug on 3DS
 	while (REG_VCOUNT != 191);
 	while (REG_VCOUNT == 191);
@@ -316,8 +192,8 @@ TWL_CODE void getConsoleID(void) {
 	u8 base[16]={0};
 	u8 in[16]={0};
 	u8 iv[16]={0};
-	u8 *scratch=(u8*)0x02F00200;
-	u8 *out=(u8*)0x02F00000;
+	u8 *scratch=(u8*)offset+0x200;
+	u8 *out=(u8*)offset;
 	u8 *key3=(u8*)0x40044D0;
 
 	aes(in, base, iv, 2);
@@ -385,10 +261,8 @@ int main() {
 	}
 
 	if (isDSiMode()) {
-		getConsoleID();
-
-		memset((void*)0x0CF80000, 0, 0x20);
-		biosDump((void*)0x02F80020, (const void*)0x00000020, 0x7FE0);
+		memset((void*)0x0C800000, 0, 0x20);
+		biosDump((void*)0x02800020, (const void*)0x00000020, 0x7FE0);
 	}
 
 	if (isDSiMode() || REG_SCFG_EXT != 0) {
@@ -513,22 +387,13 @@ int main() {
 		} else if (*(u32*)(0x2FFFD0C) == 0x454D4D43) {
 			my_sdmmc_get_cid(true, (u32*)0x2FFD7BC);	// Get eMMC CID
 			*(u32*)(0x2FFFD0C) = 0;
+		} else if (*(u32*)(0x2FFFD0C) == 0x44494347) { // 'GCID'
+			getConsoleID(*(u32*)0x2FFFD08);
+			*(u32*)(0x2FFFD0C) = 0;
 		} else if (*(u32*)(0x2FFFD0C) == 0x43535046) {
-			const u32 num = 72000;
-			const u32 den = 1001;
-			const int max = (num / den > 62) ? 74 : 62;
-
-			int vblankCount = 1;
-			while (num * (vblankCount + 1) / den < max)
-				vblankCount++;
-
-			// safety
-			if (num * vblankCount / den < max)
-			{
-				fpsa_init(&sActiveFpsa);
-				fpsa_setTargetFpsFraction(&sActiveFpsa, num * vblankCount, den);
-				fpsa_start(&sActiveFpsa);
-			}
+			SetYtrigger(202);
+			irqSet(IRQ_VCOUNT, VcountHandler);
+			irqEnable(IRQ_VCOUNT);
 
 			*(u32*)(0x2FFFD0C) = 0;
 		} else if (reset_pico) {

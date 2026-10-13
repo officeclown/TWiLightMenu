@@ -24,9 +24,11 @@
 #include "iconTitle.h"
 #include "common/twlmenusettings.h"
 #include "common/bootstrapsettings.h"
+#include "common/customLaunchers.h"
 #include "common/systemdetails.h"
 #include <gl2d.h>
 #include "common/stringtool.h"
+#include "common/dsiBanner.h"
 #include "common/tonccpy.h"
 #include "fileBrowse.h"
 #include "graphics/fontHandler.h"
@@ -41,6 +43,7 @@
 #include "ndsheaderbanner.h"
 #include "myDSiMode.h"
 #include <ctype.h>
+#include <string.h> // memcmp, for the staging compare in stageConverted()
 #include <nds.h>
 #include <nds/arm9/dldi.h>
 #include <stdio.h>
@@ -66,9 +69,36 @@ static const char16_t *blankTitle = u"";
 
 static u32 arm9StartSig[4];
 
-u8 tilesModified[(32 * 256) / 2] = {0};
+// One staging slot per icon bank, holding tiles already in texture order.
+//
+// The tile conversion below is roughly eight times the cost of the VRAM copy for
+// an animated DSi icon (4096 inner iterations against a 4 KB block move), and it
+// used to run inside the vblank handler -- which also runs the entire renderer.
+// Seven icons' worth of conversion does not fit in vblank, so the trailing
+// glTexImage2D calls landed during active display, where libnds unmaps VRAM A-D
+// to LCD mode for the duration of the copy. A and B/C/D are the 3D textures and
+// both backgrounds, so the screen loses them mid-scanout: horizontal stripes
+// through the icons while scrolling. Converting on the main thread leaves the
+// handler with just the block moves, which do fit.
+//
+// Keying by bank rather than queueing also means repeated updates of the same
+// bank within one frame collapse into a single upload, and that no pointer into
+// bnriconTile[] is held across the IRQ boundary -- the previous queue stored the
+// source pointer and the main thread could overwrite it before the handler ran.
+static u8 pendingTiles[NDS_ICON_BANK_COUNT][(32 * 256) / 2] = {0};
+static u16 pendingPalette[NDS_ICON_BANK_COUNT][16] = {0};
+static bool pendingTwl[NDS_ICON_BANK_COUNT] = {false};
+static volatile bool pendingValid[NDS_ICON_BANK_COUNT] = {false};
 
-std::vector<std::tuple<u8 *, u16 *, int, bool>> queuedIconUpdateCache;
+// Whether a bank's VRAM has been written from pendingTiles at least once. Until
+// it has, pendingTiles does not describe what is on screen (iconManagerInit fills
+// every bank with the unknown icon behind our back), so the skip below must not
+// trigger.
+static bool bankLoaded[NDS_ICON_BANK_COUNT] = {false};
+
+// Main-thread scratch for the tile conversion, so the result can be compared
+// against the bank's current contents before deciding to upload at all.
+static u8 convertScratch[(32 * 256) / 2] = {0};
 
 static void convertIconTilesToRaw(u8 *tilesSrc, u8 *tilesNew, bool twl) {
 	int PY = 32;
@@ -87,66 +117,109 @@ static void convertIconTilesToRaw(u8 *tilesSrc, u8 *tilesNew, bool twl) {
 }
 
 /**
- * Queue the icon update.
+ * This is called in graphics/vblank handler to process
+ * any deferred updates. Block moves only -- see pendingTiles above.
  */
-void deferLoadIcon(u8 *tilesSrc, u16 *palSrc, int num, bool twl) {
-	queuedIconUpdateCache.emplace_back(std::move(std::make_tuple(tilesSrc, palSrc, num, twl)));
+void execDeferredIconUpdates() {
+	for (int i = 0; i < NDS_ICON_BANK_COUNT; i++) {
+		if (!pendingValid[i])
+			continue;
+		// Out of blanking: leave the rest queued instead of unmapping VRAM under
+		// the beam. pendingValid keeps them, so they go out on the next vblank.
+		if (!vramSafeToUnmap())
+			return;
+		pendingValid[i] = false;
+		glLoadIcon(i, pendingPalette[i], pendingTiles[i], pendingTwl[i] ? TWL_TEX_HEIGHT : 32);
+		bankLoaded[i] = true;
+	}
 }
 
 /**
- * This is called in graphics/vblank handler to process
- * any deferred updates.
+ * Stages tiles that are already in texture order for upload on the next vblank.
+ * Everything that puts an icon into a bank goes through here: banner icons via
+ * loadIcon() below, the built-in per-system icons, and the blank used for folders.
+ * Those last two used to call glLoadIcon() straight from the main thread at
+ * whatever scanline iconUpdate() happened to reach them, which unmaps VRAM A-D
+ * under the beam, and they fire for every folder and every non-DS ROM.
  */
-void execDeferredIconUpdates() {
-	for (auto arg : queuedIconUpdateCache) {
-		u8 *tilesSrc;
-		u16 *palSrc;
-		int num;
-		bool twl;
-		std::tie(tilesSrc, palSrc, num, twl) = arg;
-		convertIconTilesToRaw(tilesSrc, tilesModified, twl);
-		glLoadIcon(num, (u16 *)palSrc, (u8 *)tilesModified, twl ? TWL_TEX_HEIGHT : 32);
+static void stageConverted(int num, const u16 *palette, const u8 *tiles, int texHeight = 32) {
+	if (BAD_ICON_IDX(num))
+		return;
+
+	const size_t tileBytes = (32 * texHeight) / 2;
+	const bool twl = (texHeight == TWL_TEX_HEIGHT);
+
+	// If the bank already holds exactly this, there is nothing to upload. Moving the
+	// cursor one step only changes the contents of a single bank, but every load site
+	// refreshes the whole window, so without this check six of every seven uploads --
+	// and six of every seven VRAM unmaps -- are redundant. The test is a byte
+	// comparison against what was last staged for this bank, not a guess from an
+	// index that could go stale, so it cannot leave a wrong icon on screen.
+	if (bankLoaded[num] && pendingTwl[num] == twl
+			&& memcmp(pendingTiles[num], tiles, tileBytes) == 0
+			&& memcmp(pendingPalette[num], palette, sizeof(pendingPalette[num])) == 0)
+		return;
+
+	// Drop the slot before touching the buffer, so a vblank arriving mid-copy skips
+	// this bank rather than uploading half of it. It gets picked up next frame.
+	pendingValid[num] = false;
+	tonccpy(pendingTiles[num], tiles, tileBytes);
+	tonccpy(pendingPalette[num], palette, sizeof(pendingPalette[num]));
+	pendingTwl[num] = twl;
+
+	if (currentBg == 1) {
+		pendingValid[num] = true;
+	} else {
+		// Hack to prevent glitched icons on startup.
+		// Still has to land in blanking; the callers of this path already spend a
+		// frame per icon in bgOperations(true), so yielding here costs nothing.
+		if (!vramSafeToUnmap())
+			swiWaitForVBlank();
+		glLoadIcon(num, pendingPalette[num], pendingTiles[num], texHeight);
+		bankLoaded[num] = true;
 	}
-	queuedIconUpdateCache.clear();
 }
 
 //(u8(*tilesSrc)[(32 * 32) / 2], u16(*palSrc)[16])
 void loadIcon(u8 *tilesSrc, u16 *palSrc, int num, bool twl) {
-	// Hack to prevent glitched icons on startup.
-	if (currentBg == 1) {
-		deferLoadIcon(tilesSrc, palSrc, num, twl);
-	} else {
-		convertIconTilesToRaw(tilesSrc, tilesModified, twl);
-		glLoadIcon(num, (u16 *)palSrc, (u8 *)tilesModified, twl ? TWL_TEX_HEIGHT : 32);
-	}
+	if (BAD_ICON_IDX(num))
+		return;
+	convertIconTilesToRaw(tilesSrc, convertScratch, twl);
+	stageConverted(num, palSrc, convertScratch, twl ? TWL_TEX_HEIGHT : 32);
 }
 
-static inline void loadUnkIcon(int num) { glLoadIcon(num, tex().iconUnknownTexture()->palette(), tex().iconUnknownTexture()->bytes()); }
-static inline void loadGBAIcon(int num) { glLoadIcon(num, tex().iconGBATexture()->palette(), tex().iconGBATexture()->bytes()); }
-static inline void loadGBIcon(int num) { glLoadIcon(num, tex().iconGBTexture()->palette(), tex().iconGBTexture()->bytes()); }
-static inline void loadGBCIcon(int num) { glLoadIcon(num, tex().iconGBTexture()->palette(), tex().iconGBTexture()->bytes()+(32*16)); }
-static inline void loadNESIcon(int num) { glLoadIcon(num, tex().iconNESTexture()->palette(), tex().iconNESTexture()->bytes()); }
-static inline void loadSGIcon(int num) { glLoadIcon(num, tex().iconSGTexture()->palette(), tex().iconSGTexture()->bytes()); }
-static inline void loadSMSIcon(int num) { glLoadIcon(num, tex().iconSMSTexture()->palette(), tex().iconSMSTexture()->bytes()); }
-static inline void loadGGIcon(int num) { glLoadIcon(num, tex().iconGGTexture()->palette(), tex().iconGGTexture()->bytes()); }
-static inline void loadMDIcon(int num) { glLoadIcon(num, tex().iconMDTexture()->palette(), tex().iconMDTexture()->bytes()); }
-static inline void loadSNESIcon(int num) { glLoadIcon(num, tex().iconSNESTexture()->palette(), tex().iconSNESTexture()->bytes()); }
-static inline void loadPLGIcon(int num) { glLoadIcon(num, tex().iconPLGTexture()->palette(), tex().iconPLGTexture()->bytes()); }
-static inline void loadA26Icon(int num) { glLoadIcon(num, tex().iconA26Texture()->palette(), tex().iconA26Texture()->bytes()); }
-static inline void loadCOLIcon(int num) { glLoadIcon(num, tex().iconCOLTexture()->palette(), tex().iconCOLTexture()->bytes()); }
-static inline void loadM5Icon(int num) { glLoadIcon(num, tex().iconM5Texture()->palette(), tex().iconM5Texture()->bytes()); }
-static inline void loadINTIcon(int num) { glLoadIcon(num, tex().iconINTTexture()->palette(), tex().iconINTTexture()->bytes()); }
-static inline void loadPCEIcon(int num) { glLoadIcon(num, tex().iconPCETexture()->palette(), tex().iconPCETexture()->bytes()); }
-static inline void loadWSIcon(int num) { glLoadIcon(num, tex().iconWSTexture()->palette(), tex().iconWSTexture()->bytes()); }
-static inline void loadNGPIcon(int num) { glLoadIcon(num, tex().iconNGPTexture()->palette(), tex().iconNGPTexture()->bytes()); }
-static inline void loadCPCIcon(int num) { glLoadIcon(num, tex().iconCPCTexture()->palette(), tex().iconCPCTexture()->bytes()); }
-static inline void loadVIDIcon(int num) { glLoadIcon(num, tex().iconVIDTexture()->palette(), tex().iconVIDTexture()->bytes()); }
-static inline void loadIMGIcon(int num) { glLoadIcon(num, tex().iconIMGTexture()->palette(), tex().iconIMGTexture()->bytes()); }
-static inline void loadMSXIcon(int num) { glLoadIcon(num, tex().iconMSXTexture()->palette(), tex().iconMSXTexture()->bytes()); }
-static inline void loadMINIcon(int num) { glLoadIcon(num, tex().iconMINITexture()->palette(), tex().iconMINITexture()->bytes()); }
-static inline void loadHBIcon(int num) { glLoadIcon(num, tex().iconHBTexture()->palette(), tex().iconHBTexture()->bytes()); }
+static inline void loadUnkIcon(int num) { stageConverted(num, tex().iconUnknownTexture()->palette(), tex().iconUnknownTexture()->bytes()); }
+static inline void loadGBAIcon(int num) { stageConverted(num, tex().iconGBATexture()->palette(), tex().iconGBATexture()->bytes()); }
+static inline void loadGBIcon(int num) { stageConverted(num, tex().iconGBTexture()->palette(), tex().iconGBTexture()->bytes()); }
+static inline void loadGBCIcon(int num) { stageConverted(num, tex().iconGBTexture()->palette(), tex().iconGBTexture()->bytes()+(32*16)); }
+static inline void loadNESIcon(int num) { stageConverted(num, tex().iconNESTexture()->palette(), tex().iconNESTexture()->bytes()); }
+static inline void loadSGIcon(int num) { stageConverted(num, tex().iconSGTexture()->palette(), tex().iconSGTexture()->bytes()); }
+static inline void loadSMSIcon(int num) { stageConverted(num, tex().iconSMSTexture()->palette(), tex().iconSMSTexture()->bytes()); }
+static inline void loadGGIcon(int num) { stageConverted(num, tex().iconGGTexture()->palette(), tex().iconGGTexture()->bytes()); }
+static inline void loadMDIcon(int num) { stageConverted(num, tex().iconMDTexture()->palette(), tex().iconMDTexture()->bytes()); }
+static inline void loadSNESIcon(int num) { stageConverted(num, tex().iconSNESTexture()->palette(), tex().iconSNESTexture()->bytes()); }
+static inline void loadPLGIcon(int num) { stageConverted(num, tex().iconPLGTexture()->palette(), tex().iconPLGTexture()->bytes()); }
+static inline void loadA26Icon(int num) { stageConverted(num, tex().iconA26Texture()->palette(), tex().iconA26Texture()->bytes()); }
+static inline void loadCOLIcon(int num) { stageConverted(num, tex().iconCOLTexture()->palette(), tex().iconCOLTexture()->bytes()); }
+static inline void loadM5Icon(int num) { stageConverted(num, tex().iconM5Texture()->palette(), tex().iconM5Texture()->bytes()); }
+static inline void loadINTIcon(int num) { stageConverted(num, tex().iconINTTexture()->palette(), tex().iconINTTexture()->bytes()); }
+static inline void loadPCEIcon(int num) { stageConverted(num, tex().iconPCETexture()->palette(), tex().iconPCETexture()->bytes()); }
+static inline void loadWSIcon(int num) { stageConverted(num, tex().iconWSTexture()->palette(), tex().iconWSTexture()->bytes()); }
+static inline void loadNGPIcon(int num) { stageConverted(num, tex().iconNGPTexture()->palette(), tex().iconNGPTexture()->bytes()); }
+static inline void loadCPCIcon(int num) { stageConverted(num, tex().iconCPCTexture()->palette(), tex().iconCPCTexture()->bytes()); }
+static inline void loadVIDIcon(int num) { stageConverted(num, tex().iconVIDTexture()->palette(), tex().iconVIDTexture()->bytes()); }
+static inline void loadIMGIcon(int num) { stageConverted(num, tex().iconIMGTexture()->palette(), tex().iconIMGTexture()->bytes()); }
+static inline void loadMSXIcon(int num) { stageConverted(num, tex().iconMSXTexture()->palette(), tex().iconMSXTexture()->bytes()); }
+static inline void loadMINIcon(int num) { stageConverted(num, tex().iconMINITexture()->palette(), tex().iconMINITexture()->bytes()); }
+static inline void loadHBIcon(int num) { stageConverted(num, tex().iconHBTexture()->palette(), tex().iconHBTexture()->bytes()); }
 
-static inline void clearIcon(int num) { glClearIcon(num); }
+static inline void clearIcon(int num) {
+	// Same path as everything else, with zeroes as the source; full height, as
+	// glClearIcon() used.
+	static const u16 blankPalette[16] = {0};
+	toncset(convertScratch, 0, sizeof(convertScratch));
+	stageConverted(num, blankPalette, convertScratch, TWL_TEX_HEIGHT);
+}
 
 void convertIconPalette(sNDSBannerExt* ndsBanner) {
 	effectColorModePalette(ndsBanner->palette, 16);
@@ -160,12 +233,12 @@ void convertIconPalette(sNDSBannerExt* ndsBanner) {
 
 void drawIcon(int Xpos, int Ypos, int num) {
 	if (num == -1) { // Moving app icon
-		glSprite(Xpos, Ypos, bannerFlip[40], &getIcon(6)[bnriconframenumY[40]]);
+		glSprite(Xpos, Ypos, bannerFlip[40], &getIcon(ICON_MOVING_BANK)[bnriconframenumY[40]]);
 		if (bnriconPalLine[40] != bnriconPalLoaded[40]) {
 			bnriconPalLoaded[40] = -1; // defer loading the palette
 		}
 	} else {
-		glSprite(Xpos, Ypos, bannerFlip[num], &getIcon(num % 6)[bnriconframenumY[num]]);
+		glSprite(Xpos, Ypos, bannerFlip[num], &getIcon(ICON_GRID_BANK(num))[bnriconframenumY[num]]);
 		if (bnriconPalLine[num] != bnriconPalLoaded[num]) {
 			bnriconPalLoaded[num] = -1; // defer loading the palette
 		}
@@ -175,7 +248,11 @@ void drawIcon(int Xpos, int Ypos, int num) {
 void loadDeferredIconPalettes() {
 	for (int i = 0; i < 41; i++) {
 		if (bnriconPalLoaded[i] == -1) {
-			glLoadPalette(i < 40 ? i % 6 : 6, bnriconTile[i].dsi_palette[bnriconPalLine[i]]);
+			// As in execDeferredIconUpdates: the flag stays -1, so whatever is left
+			// is retried on the next vblank rather than tearing this frame.
+			if (!vramSafeToUnmap())
+				return;
+			glLoadPalette(i < 40 ? ICON_GRID_BANK(i) : ICON_MOVING_BANK, bnriconTile[i].dsi_palette[bnriconPalLine[i]]);
 			bnriconPalLoaded[i] = bnriconPalLine[i];
 		}
 	}
@@ -187,7 +264,7 @@ void clearTitle(int num) {
 
 void getGameInfo(bool isDir, const char *name, int num, bool fromArgv) {
 	if (num == -1)
-		num = 40;
+		num = MOVING_APP_SLOT;
 
 	bnriconPalLine[num] = 0;
 	bnriconPalLoaded[num] = 0;
@@ -198,6 +275,7 @@ void getGameInfo(bool isDir, const char *name, int num, bool fromArgv) {
 	isValid[num] = false;
 	isTwlm[num] = false;
 	isUnlaunch[num] = false;
+	isNdz[num] = false;
 	isDSiWare[num] = false;
 	isHomebrew[num] = true;
 	isModernHomebrew[num] = true;
@@ -209,7 +287,12 @@ void getGameInfo(bool isDir, const char *name, int num, bool fromArgv) {
 		infoFound[num] = false;
 	}
 
-	if (ms().showCustomIcons && customIcon[num] < 2 && (!fromArgv || customIcon[num] <= 0)) {
+	// A user-defined file-type banner (extras/config.<ext>.ini) backs up the per-file
+	// icons/ overrides below, and applies even when custom icons are turned off.
+	const CustomLauncher *customLauncher = (!isDir && name) ? findCustomLauncher(name) : NULL;
+	const bool bannerFromLauncher = (customLauncher && !customLauncher->bannerPath.empty());
+
+	if ((ms().showCustomIcons || bannerFromLauncher) && customIcon[num] < 2 && (!fromArgv || customIcon[num] <= 0)) {
 		sNDSBannerExt &banner = bnriconTile[num];
 		bool argvHadPng = customIcon[num] == 1;
 		u8 iconCopy[512];
@@ -222,9 +305,26 @@ void getGameInfo(bool isDir, const char *name, int num, bool fromArgv) {
 		toncset(&banner, 0, sizeof(sNDSBannerExt));
 		bool customIconGood = false;
 
-		// First try banner bin
-		snprintf(customIconPath, sizeof(customIconPath), "%s:/_nds/TWiLightMenu/icons/%s.bin", sys().isRunFromSD() ? "sd" : "fat", name);
-		if (access(customIconPath, F_OK) == 0) {
+		// Per-file overrides from icons/ first, then the file-type banner from the ini.
+		// The per-file lookups stay behind showCustomIcons; the ini banner does not.
+		bool customIconIsPng = false;
+		bool customIconFound = false;
+		if (ms().showCustomIcons) {
+			snprintf(customIconPath, sizeof(customIconPath), "%s:/_nds/TWiLightMenu/icons/%s.bin", sys().isRunFromSD() ? "sd" : "fat", name);
+			customIconFound = (access(customIconPath, F_OK) == 0);
+			if (!customIconFound) {
+				snprintf(customIconPath, sizeof(customIconPath), "%s:/_nds/TWiLightMenu/icons/%s.png", sys().isRunFromSD() ? "sd" : "fat", name);
+				customIconFound = (access(customIconPath, F_OK) == 0);
+				customIconIsPng = customIconFound;
+			}
+		}
+		if (!customIconFound && bannerFromLauncher) {
+			snprintf(customIconPath, sizeof(customIconPath), "%s", customLauncher->bannerPath.c_str());
+			customIconFound = true;
+			customIconIsPng = customLauncher->bannerIsPng;
+		}
+
+		if (customIconFound && !customIconIsPng) {
 			customIcon[num] = 2; // custom icon is a banner bin
 			FILE *file = fopen(customIconPath, "rb");
 			if (file) {
@@ -263,11 +363,10 @@ void getGameInfo(bool isDir, const char *name, int num, bool fromArgv) {
 					convertIconPalette(&banner);
 				}
 			}
-		} else if (customIcon[num] == 0) {
-			// If no banner bin, try png
-			snprintf(customIconPath, sizeof(customIconPath), "%s:/_nds/TWiLightMenu/icons/%s.png", sys().isRunFromSD() ? "sd" : "fat", name);
-			customIcon[num] = (access(customIconPath, F_OK) == 0);
-			if (customIcon[num]) {
+		} else if (customIconFound && customIcon[num] == 0) {
+			// customIconPath already holds the resolved png
+			customIcon[num] = 1; // custom icon is a png
+			{
 				std::vector<unsigned char> image;
 				uint imageWidth, imageHeight;
 				lodepng::decode(image, imageWidth, imageHeight, customIconPath);
@@ -431,7 +530,7 @@ void getGameInfo(bool isDir, const char *name, int num, bool fromArgv) {
 		fread(gameTid[num], 1, 4, fp);
 
 		fclose(fp);
-	} else if (extension(name, {".nds", ".dsi", ".ids", ".srl", ".app"})) {
+	} else if (extension(name, {".nds", ".ndz", ".dsi", ".ids", ".srl", ".app"})) {
 		// this is an nds/app file!
 		FILE *fp;
 
@@ -459,42 +558,71 @@ void getGameInfo(bool isDir, const char *name, int num, bool fromArgv) {
 			}
 		}
 
-		if (num < 40) {
-			tonccpy(gameTid[num], ndsHeader.gameCode, 4);
-			isValid[num] = (ndsHeader.arm9destination >= 0x02000000 && ndsHeader.arm9destination < 0x03000000 && ndsHeader.arm9executeAddress >= 0x02000000 && ndsHeader.arm9executeAddress < 0x03000000);
-			isTwlm[num] = (strcmp(gameTid[num], "SRLA") == 0);
-			isUnlaunch[num] = (memcmp(ndsHeader.gameTitle, "UNLAUNCH.DSI", 12) == 0);
-			romVersion[num] = ndsHeader.romversion;
-			unitCode[num] = ndsHeader.unitCode;
-			headerCRC[num] = ndsHeader.headerCRC16;
-			a7mbk6[num] = ndsHeader.a7mbk6;
+		isNdz[num] = (memcmp(ndsHeader.gameTitle, "NDZ1", 4) == 0);
+		if (isNdz[num]) {
+			fseek(fp, 0x2410, SEEK_SET);
+			fread(ndsHeader.gameCode, 1, 4, fp);
+			fseek(fp, 0x2418, SEEK_SET);
+			fread(&ndsHeader.headerCRC16, sizeof(u16), 1, fp);
 		}
 
-		fseek(fp, ndsHeader.arm9romOffset + ((strncmp(gameTid[num], "BIG", 3) == 0) ? 0x02000800 : ndsHeader.arm9executeAddress) - ndsHeader.arm9destination, SEEK_SET);
-		// "Battle/Combat of Giants: Mutant Insects" (TID: BIG) has code that is run before the actual SDK boot code
-		fread(arm9StartSig, sizeof(u32), 4, fp);
-		if ((arm9StartSig[0] == 0xE3A0C301 || (arm9StartSig[0] >= 0xEA000000 && arm9StartSig[0] < 0xEC000000 /* If title contains cracktro or extra splash */))
-		  && arm9StartSig[1] == 0xE58CC208) {
-			// Title seems to be developed with Nintendo SDK, verify
-			if ((arm9StartSig[2] >= 0xEB000000 && arm9StartSig[2] < 0xEC000000) // SDK 2 & TWL SDK 5
-			 && (arm9StartSig[3] >= 0xE3A00000 && arm9StartSig[3] < 0xE3A01000)) {
-				isHomebrew[num] = false;
-				isModernHomebrew[num] = false;
-			} else
-			if (arm9StartSig[2] == 0xE1DC00B6 // SDK 3-5
-			 && arm9StartSig[3] == 0xE3500000) {
-				isHomebrew[num] = false;
-				isModernHomebrew[num] = false;
-			} else
-			if (arm9StartSig[2] == 0xEAFFFFFF // SDK 4 (HM DS Cute)
-			 && arm9StartSig[3] == 0xE1DC00B6) {
+		if (num < 40) {
+			tonccpy(gameTid[num], ndsHeader.gameCode, 4);
+			isTwlm[num] = (strcmp(gameTid[num], "SRLA") == 0);
+			headerCRC[num] = ndsHeader.headerCRC16;
+			if (isNdz[num]) {
+				isValid[num] = true;
+				if (gameTid[num][0] == 'D') {
+					unitCode[num] = 0x03;
+				} else if (gameTid[num][0] == 'V'
+				 || strncmp(gameTid[num], "IRB", 3) == 0 // Pokémon Gen 5
+				 || strncmp(gameTid[num], "IRA", 3) == 0
+				 || strncmp(gameTid[num], "IRE", 3) == 0
+				 || strncmp(gameTid[num], "IRD", 3) == 0
+				) {
+					unitCode[num] = 0x02;
+				} else {
+					unitCode[num] = 0;
+				}
+			} else {
+				isValid[num] = (ndsHeader.arm9destination >= 0x02000000 && ndsHeader.arm9destination < 0x03000000 && ndsHeader.arm9executeAddress >= 0x02000000 && ndsHeader.arm9executeAddress < 0x03000000);
+				isUnlaunch[num] = (memcmp(ndsHeader.gameTitle, "UNLAUNCH.DSI", 12) == 0);
+				romVersion[num] = ndsHeader.romversion;
+				unitCode[num] = ndsHeader.unitCode;
+				a7mbk6[num] = ndsHeader.a7mbk6;
+			}
+		}
+
+		if (isNdz[num]) {
+			isHomebrew[num] = false;
+			isModernHomebrew[num] = false;
+		} else {
+			fseek(fp, ndsHeader.arm9romOffset + ((strncmp(gameTid[num], "BIG", 3) == 0) ? 0x02000800 : ndsHeader.arm9executeAddress) - ndsHeader.arm9destination, SEEK_SET);
+			// "Battle/Combat of Giants: Mutant Insects" (TID: BIG) has code that is run before the actual SDK boot code
+			fread(arm9StartSig, sizeof(u32), 4, fp);
+			if ((arm9StartSig[0] == 0xE3A0C301 || (arm9StartSig[0] >= 0xEA000000 && arm9StartSig[0] < 0xEC000000 /* If title contains cracktro or extra splash */))
+			  && arm9StartSig[1] == 0xE58CC208) {
+				// Title seems to be developed with Nintendo SDK, verify
+				if ((arm9StartSig[2] >= 0xEB000000 && arm9StartSig[2] < 0xEC000000) // SDK 2 & TWL SDK 5
+				 && (arm9StartSig[3] >= 0xE3A00000 && arm9StartSig[3] < 0xE3A01000)) {
+					isHomebrew[num] = false;
+					isModernHomebrew[num] = false;
+				} else
+				if (arm9StartSig[2] == 0xE1DC00B6 // SDK 3-5
+				 && arm9StartSig[3] == 0xE3500000) {
+					isHomebrew[num] = false;
+					isModernHomebrew[num] = false;
+				} else
+				if (arm9StartSig[2] == 0xEAFFFFFF // SDK 4 (HM DS Cute)
+				 && arm9StartSig[3] == 0xE1DC00B6) {
+					isHomebrew[num] = false;
+					isModernHomebrew[num] = false;
+				}
+			} else if (strncmp(gameTid[num], "HNA", 3) == 0) {
+				// Modcrypted
 				isHomebrew[num] = false;
 				isModernHomebrew[num] = false;
 			}
-		} else if (strncmp(gameTid[num], "HNA", 3) == 0) {
-			// Modcrypted
-			isHomebrew[num] = false;
-			isModernHomebrew[num] = false;
 		}
 
 		if (isHomebrew[num]) {
@@ -504,8 +632,9 @@ void getGameInfo(bool isDir, const char *name, int num, bool fromArgv) {
 			 && arm9StartSig[3] == 0xE129F000) {
 				// isModernHomebrew[num] = true; // Homebrew is recent (supports reading from SD without a DLDI driver)
 				if (ndsHeader.arm7executeAddress >= 0x037F0000 && ndsHeader.arm7destination >= 0x037F0000) {
-					if ((ndsHeader.arm9binarySize == 0xC9F68 && ndsHeader.arm7binarySize == 0x12814)	// Colors! v1.1
-					|| (ndsHeader.arm9binarySize == 0x1B0864 && ndsHeader.arm7binarySize == 0xDB50)	// Mario Paint Composer DS v2 (Bullet Bill)
+					if ((ndsHeader.arm7binarySize == 0x119A8)	// DS Game Maker homebrew
+					|| (ndsHeader.arm9binarySize == 0xC9F68 && ndsHeader.arm7binarySize == 0x12814)		// Colors! v1.1
+					|| (ndsHeader.arm9binarySize == 0x1B0864 && ndsHeader.arm7binarySize == 0xDB50)		// Mario Paint Composer DS v2 (Bullet Bill)
 					|| (ndsHeader.arm9binarySize == 0xE78FC && ndsHeader.arm7binarySize == 0xF068)		// SnowBros v2.2
 					|| (ndsHeader.arm9binarySize == 0xD45C0 && ndsHeader.arm7binarySize == 0x2B7C)		// ikuReader v0.058
 					|| (ndsHeader.arm9binarySize == 0x7A124 && ndsHeader.arm7binarySize == 0xEED0)		// PPSEDS r11
@@ -520,18 +649,15 @@ void getGameInfo(bool isDir, const char *name, int num, bool fromArgv) {
 				isModernHomebrew[num] = false; // Homebrew is old (requires a DLDI driver to read from SD)
 			}
 			if (!ms().secondaryDevice && num < 40) {
-				if ((ndsHeader.arm9binarySize == 0x98F70 && ndsHeader.arm7binarySize == 0xED94)		// jEnesisDS 0.7.4
-				|| (ndsHeader.arm9binarySize == 0x48950 && ndsHeader.arm7binarySize == 0x74C4)			// SNEmulDS06-WIP2
-				|| (ndsHeader.arm9binarySize == 0xD45C0 && ndsHeader.arm7binarySize == 0x2B7C)			// ikuReader v0.058
-				|| (ndsHeader.arm9binarySize == 0x54620 && ndsHeader.arm7binarySize == 0x1538)) {		// XRoar 0.24fp3
+				if (ndsHeader.arm9binarySize == 0x54620 && ndsHeader.arm7binarySize == 0x1538) {		// XRoar 0.24fp3
 					requiresRamDisk[num] = true;
 				}
 			}
-		} else if (ndsHeader.unitCode != 0 && (ndsHeader.accessControl & BIT(4))) {
+		} else if (!isNdz[num] && ndsHeader.unitCode != 0 && (ndsHeader.accessControl & BIT(4))) {
 			isDSiWare[num] = true; // Is a DSiWare game
 		}
 
-		if (num < 40 && !isHomebrew[num]) {
+		if (num < 40 && !isNdz[num] && !isHomebrew[num]) {
 			// Check if ROM needs a donor ROM
 			bool dsiEnhancedMbk = (isDSiMode() && *(u32*)0x02FFE1A0 == 0x00403000 && sys().arm7SCFGLocked());
 			if (isDSiMode() && (a7mbk6[num] == (dsiEnhancedMbk ? 0x080037C0 : 0x00403000) || (ndsHeader.gameCode[0] == 'H' && ndsHeader.arm7binarySize < 0xC000 && ndsHeader.arm7idestination == 0x02E80000 && (REG_MBK9 & 0x00FFFFFF) != 0x00FFFF0F)) && sys().arm7SCFGLocked()) {
@@ -552,10 +678,12 @@ void getGameInfo(bool isDir, const char *name, int num, bool fromArgv) {
 
 		bnrSysSettings[num] = (ndsHeader.gameCode[0] == 0x48 && ndsHeader.gameCode[1] == 0x4E && ndsHeader.gameCode[2] == 0x42);
 
-		if (ndsHeader.dsi_flags & BIT(4))
-			bnrWirelessIcon[num] = 1;
-		else if (ndsHeader.dsi_flags & BIT(3))
-			bnrWirelessIcon[num] = 2;
+		if (!isNdz[num]) {
+			if (ndsHeader.dsi_flags & BIT(4))
+				bnrWirelessIcon[num] = 1;
+			else if (ndsHeader.dsi_flags & BIT(3))
+				bnrWirelessIcon[num] = 2;
+		}
 
 		if (customIcon[num] == 2) { // custom banner bin
 			// we're done early, close the file
@@ -573,7 +701,7 @@ void getGameInfo(bool isDir, const char *name, int num, bool fromArgv) {
 			memcpy(paletteCopy, ndsBanner.palette, sizeof(paletteCopy));
 		}
 
-		if (ndsHeader.bannerOffset == 0) {
+		if (!isNdz[num] && ndsHeader.bannerOffset == 0) {
 			fclose(fp);
 
 			// If no custom icon, display as unknown
@@ -582,10 +710,14 @@ void getGameInfo(bool isDir, const char *name, int num, bool fromArgv) {
 
 			return;
 		}
-		fseek(fp, ndsHeader.bannerOffset, SEEK_SET);
+		const u32 bannerOffset = isNdz[num] ? 0x10 : ndsHeader.bannerOffset;
+		fseek(fp, bannerOffset, SEEK_SET);
 		if (!fread(&ndsBanner, sizeof(ndsBanner), 1, fp)) {
+			// Only the NTR portion of the banner will be read, so clear the DSi
+			// animation data left behind by the previously loaded ROM.
+			toncset(ndsBanner.dsi_icon, 0, DSI_BANNER_ANIME_SIZE);
 			// try again, but using regular banner size
-			fseek(fp, ndsHeader.bannerOffset, SEEK_SET);
+			fseek(fp, bannerOffset, SEEK_SET);
 			if (!fread(&ndsBanner, NDS_BANNER_SIZE_ORIGINAL, 1, fp)) {
 				fclose(fp);
 
@@ -622,7 +754,9 @@ void getGameInfo(bool isDir, const char *name, int num, bool fromArgv) {
 			return;
 		}
 
-		if (ndsHeader.dsi_flags & BIT(2)) {
+		if (!isNdz[num] && (ndsHeader.dsi_flags & BIT(2))) {
+			std::string bnrPath;
+			std::string altBnrPath;
 			{
 				std::string filename = name;
 
@@ -635,7 +769,7 @@ void getGameInfo(bool isDir, const char *name, int num, bool fromArgv) {
 
 				std::string typeToReplace = filename.substr(filename.rfind('.'));
 
-				std::string bnrPath = romFolderNoSlash + "/saves/" + filename;
+				bnrPath = romFolderNoSlash + "/saves/" + filename;
 				if (ms().saveLocation == TWLSettings::ETWLMFolder) {
 					std::string twlmSavesFolder = sys().isRunFromSD() ? "sd:/_nds/TWiLightMenu/saves" : "fat:/_nds/TWiLightMenu/saves";
 					bnrPath = twlmSavesFolder + "/" + filename;
@@ -645,34 +779,28 @@ void getGameInfo(bool isDir, const char *name, int num, bool fromArgv) {
 				extern std::string getBnrExtension(void);
 				bnrPath = replaceAll(bnrPath, typeToReplace, getBnrExtension());
 
+				// A NAND/GM9i dump leaves the title's own banner save next to the ROM
+				// as a plain .bnr, which never carries a TWiLightMenu save slot suffix.
+				altBnrPath = replaceAll(romFolderNoSlash + "/" + filename, typeToReplace, ".bnr");
+
 				logPrint("Banner save path: %s\n", bnrPath.c_str());
-				fp = fopen(bnrPath.c_str(), "rb");
 			}
 
-			if (fp) {
-				logPrint("Banner save found!\n");
+			// The banner save is validated in full before anything is applied, so a
+			// blank or corrupt one leaves the ROM's own banner untouched.
+			if (dsiSubBannerLoad(bnrPath.c_str(), ndsBanner.dsi_icon, &ndsBanner.crc[3])
+			 || (altBnrPath != bnrPath && dsiSubBannerLoad(altBnrPath.c_str(), ndsBanner.dsi_icon, &ndsBanner.crc[3]))) {
+				logPrint("Banner save is valid.\n");
 
-				u16 ver = 0;
-				u16 crc16 = 0;
-				fread(&ver, sizeof(u16), 1, fp);
-				fseek(fp, 8, SEEK_SET);
-				fread(&crc16, sizeof(u16), 1, fp);
-				if (ver == NDS_BANNER_VER_DSi && crc16 != 0) {
-					logPrint("Banner save is valid.\n");
+				// A sub-banner only ever uses palette 0.
+				tonccpy(ndsBanner.icon, ndsBanner.dsi_icon, 512);
+				tonccpy(ndsBanner.palette, ndsBanner.dsi_palette, 16*sizeof(u16));
 
-					ndsBanner.crc[3] = crc16;
-
-					fseek(fp, 0x20, SEEK_SET);
-					fread(ndsBanner.dsi_icon, 1, 0x1180, fp);
-
-					tonccpy(ndsBanner.icon, ndsBanner.dsi_icon, 512);
-					tonccpy(ndsBanner.palette, ndsBanner.dsi_palette, 16*sizeof(u16));
-				} else {
-					logPrint("Banner save is invalid.\n");
-				}
-				fclose(fp);
+				// The banner now holds valid DSi animation data even when the ROM's
+				// own banner is NTR-only, so let the DSi code paths pick it up.
+				ndsBanner.version = NDS_BANNER_VER_DSi;
 			} else {
-				logPrint("Banner save not found!\n");
+				logPrint("No valid banner save.\n");
 			}
 		}
 
@@ -693,7 +821,8 @@ void getGameInfo(bool isDir, const char *name, int num, bool fromArgv) {
 void iconUpdate(bool isDir, const char *name, int num) {
 	logPrint("iconUpdate: ");
 
-	int spriteIdx = num == -1 ? 6 : num % 6;
+	const int listIdx = num; // -1 for the moving app, else the 0..39 grid position
+	const int spriteIdx = (num == -1) ? ICON_MOVING_BANK : ICON_GRID_BANK(num);
 	if (num == -1)
 		num = 40;
 
@@ -766,7 +895,7 @@ void iconUpdate(bool isDir, const char *name, int num) {
 					logPrint("Folder found!");
 					clearIcon(spriteIdx);
 				} else {
-					iconUpdate(false, p, spriteIdx);
+					iconUpdate(false, p, listIdx);
 				}
 			} else {
 				// this is not an nds/app file!

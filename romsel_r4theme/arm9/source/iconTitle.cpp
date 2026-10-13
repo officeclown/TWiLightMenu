@@ -29,8 +29,10 @@
 #include <gl2d.h>
 #include "common/twlmenusettings.h"
 #include "common/bootstrapsettings.h"
+#include "common/customLaunchers.h"
 #include "common/systemdetails.h"
 #include "common/stringtool.h"
+#include "common/dsiBanner.h"
 #include "common/tonccpy.h"
 #include "fileBrowse.h"
 #include "graphics/fontHandler.h"
@@ -914,6 +916,7 @@ void getGameInfo(int fileOffset, bool isDir, const char* name, bool fromArgv)
 	toncset(gameTid, 0, 4);
 	isValid = false;
 	isTwlm = false;
+	isNdz = false;
 	isDSiWare = false;
 	isHomebrew = true;
 	isModernHomebrew = true;
@@ -925,7 +928,12 @@ void getGameInfo(int fileOffset, bool isDir, const char* name, bool fromArgv)
 		infoFound = false;
 	}
 
-	if ((ms().theme != TWLSettings::EThemeGBC || ms().filenameDisplay < 2) && ms().showCustomIcons && !preloadedBannerIconFound(fileOffset) && customIcon < 2 && (!fromArgv || customIcon <= 0)) {
+	// A user-defined file-type banner (extras/config.<ext>.ini) backs up the per-file
+	// icons/ overrides below, and applies even when custom icons are turned off.
+	const CustomLauncher *customLauncher = (!isDir && name) ? findCustomLauncher(name) : NULL;
+	const bool bannerFromLauncher = (customLauncher && !customLauncher->bannerPath.empty());
+
+	if ((ms().theme != TWLSettings::EThemeGBC || ms().filenameDisplay < 2) && (ms().showCustomIcons || bannerFromLauncher) && !preloadedBannerIconFound(fileOffset) && customIcon < 2 && (!fromArgv || customIcon <= 0)) {
 		toncset(&ndsBanner, 0, sizeof(sNDSBannerExt));
 		const bool argvHadPng = customIcon == 1;
 		u8 iconCopy[512];
@@ -938,9 +946,26 @@ void getGameInfo(int fileOffset, bool isDir, const char* name, bool fromArgv)
 		toncset(&ndsBanner, 0, sizeof(sNDSBannerExt));
 		bool customIconGood = false;
 
-		// First try banner bin
-		snprintf(customIconPath, sizeof(customIconPath), "%s:/_nds/TWiLightMenu/icons/%s.bin", sys().isRunFromSD() ? "sd" : "fat", name);
-		if (access(customIconPath, F_OK) == 0) {
+		// Per-file overrides from icons/ first, then the file-type banner from the ini.
+		// The per-file lookups stay behind showCustomIcons; the ini banner does not.
+		bool customIconIsPng = false;
+		bool customIconFound = false;
+		if (ms().showCustomIcons) {
+			snprintf(customIconPath, sizeof(customIconPath), "%s:/_nds/TWiLightMenu/icons/%s.bin", sys().isRunFromSD() ? "sd" : "fat", name);
+			customIconFound = (access(customIconPath, F_OK) == 0);
+			if (!customIconFound) {
+				snprintf(customIconPath, sizeof(customIconPath), "%s:/_nds/TWiLightMenu/icons/%s.png", sys().isRunFromSD() ? "sd" : "fat", name);
+				customIconFound = (access(customIconPath, F_OK) == 0);
+				customIconIsPng = customIconFound;
+			}
+		}
+		if (!customIconFound && bannerFromLauncher) {
+			snprintf(customIconPath, sizeof(customIconPath), "%s", customLauncher->bannerPath.c_str());
+			customIconFound = true;
+			customIconIsPng = customLauncher->bannerIsPng;
+		}
+
+		if (customIconFound && !customIconIsPng) {
 			customIcon = 2; // custom icon is a banner bin
 			FILE *file = fopen(customIconPath, "rb");
 			if (file) {
@@ -964,11 +989,10 @@ void getGameInfo(int fileOffset, bool isDir, const char* name, bool fromArgv)
 					}
 				}
 			}
-		} else {
-			// If no banner bin, try png
-			snprintf(customIconPath, sizeof(customIconPath), "%s:/_nds/TWiLightMenu/icons/%s.png", sys().isRunFromSD() ? "sd" : "fat", name);
-			customIcon = (access(customIconPath, F_OK) == 0);
-			if (customIcon) {
+		} else if (customIconFound) {
+			// customIconPath already holds the resolved png
+			customIcon = 1; // custom icon is a png
+			{
 				std::vector<unsigned char> image;
 				uint imageWidth, imageHeight;
 				lodepng::decode(image, imageWidth, imageHeight, customIconPath);
@@ -1119,7 +1143,7 @@ void getGameInfo(int fileOffset, bool isDir, const char* name, bool fromArgv)
 		fread(gameTid, 1, 4, fp);
 
 		fclose(fp);
-	} else if (extension(name, {".nds", ".dsi", ".ids", ".srl", ".app"})) {
+	} else if (extension(name, {".nds", ".ndz", ".dsi", ".ids", ".srl", ".app"})) {
 		// this is an nds/app file!
 		// open file for reading info
 		FILE *fp = fopen(name, "rb");
@@ -1133,14 +1157,23 @@ void getGameInfo(int fileOffset, bool isDir, const char* name, bool fromArgv)
 
 		if (preloadedHeaderFound(fileOffset)) {
 			tonccpy(&ndsHeader, getPreloadedHeader(fileOffset), sizeof(sNDSHeaderExt));
-		} else if (!fread(&ndsHeader, sizeof(sNDSHeaderExt), 1, fp)) {
-			// try again, but using regular header size
-			fseek(fp, 0, SEEK_SET);
-			if (!fread(&ndsHeader, 0x160, 1, fp)) {
-				if (customIcon != 2)
-					clearBannerSequence();
-				fclose(fp);
-				return;
+		} else {
+			if (!fread(&ndsHeader, sizeof(sNDSHeaderExt), 1, fp)) {
+				// try again, but using regular header size
+				fseek(fp, 0, SEEK_SET);
+				if (!fread(&ndsHeader, 0x160, 1, fp)) {
+					if (customIcon != 2)
+						clearBannerSequence();
+					fclose(fp);
+					return;
+				}
+			}
+
+			if (memcmp(ndsHeader.gameTitle, "NDZ1", 4) == 0) {
+				fseek(fp, 0x2410, SEEK_SET);
+				fread(ndsHeader.gameCode, 1, 4, fp);
+				fseek(fp, 0x2418, SEEK_SET);
+				fread(&ndsHeader.headerCRC16, sizeof(u16), 1, fp);
 			}
 		}
 
@@ -1154,38 +1187,61 @@ void getGameInfo(int fileOffset, bool isDir, const char* name, bool fromArgv)
 			}
 		}
 
-		tonccpy(gameTid, ndsHeader.gameCode, 4);
-		isValid = (ndsHeader.arm9destination >= 0x02000000 && ndsHeader.arm9destination < 0x03000000 && ndsHeader.arm9executeAddress >= 0x02000000 && ndsHeader.arm9executeAddress < 0x03000000);
-		isTwlm = (strcmp(gameTid, "SRLA") == 0);
-		romVersion = ndsHeader.romversion;
-		romUnitCode = ndsHeader.unitCode;
-		a7mbk6 = ndsHeader.a7mbk6;
+		isNdz = (memcmp(ndsHeader.gameTitle, "NDZ1", 4) == 0);
 
-		fseek(fp, ndsHeader.arm9romOffset + ((strncmp(gameTid, "BIG", 3) == 0) ? 0x02000800 : ndsHeader.arm9executeAddress) - ndsHeader.arm9destination, SEEK_SET);
-		// "Battle/Combat of Giants: Mutant Insects" (TID: BIG) has code that is run before the actual SDK boot code
-		fread(arm9StartSig, sizeof(u32), 4, fp);
-		if ((arm9StartSig[0] == 0xE3A0C301 || (arm9StartSig[0] >= 0xEA000000 && arm9StartSig[0] < 0xEC000000 /* If title contains cracktro or extra splash */))
-		  && arm9StartSig[1] == 0xE58CC208) {
-			// Title seems to be developed with Nintendo SDK, verify
-			if ((arm9StartSig[2] >= 0xEB000000 && arm9StartSig[2] < 0xEC000000) // SDK 2 & TWL SDK 5
-			 && (arm9StartSig[3] >= 0xE3A00000 && arm9StartSig[3] < 0xE3A01000)) {
-				isHomebrew = false;
-				isModernHomebrew = false;
-			} else
-			if (arm9StartSig[2] == 0xE1DC00B6 // SDK 3-5
-			 && arm9StartSig[3] == 0xE3500000) {
-				isHomebrew = false;
-				isModernHomebrew = false;
-			} else
-			if (arm9StartSig[2] == 0xEAFFFFFF // SDK 4 (HM DS Cute)
-			 && arm9StartSig[3] == 0xE1DC00B6) {
+		tonccpy(gameTid, ndsHeader.gameCode, 4);
+		isTwlm = (strcmp(gameTid, "SRLA") == 0);
+		if (isNdz) {
+			isValid = true;
+			if (gameTid[0] == 'D') {
+				romUnitCode = 0x03;
+			} else if (gameTid[0] == 'V'
+			 || strncmp(gameTid, "IRB", 3) == 0 // Pokémon Gen 5
+			 || strncmp(gameTid, "IRA", 3) == 0
+			 || strncmp(gameTid, "IRE", 3) == 0
+			 || strncmp(gameTid, "IRD", 3) == 0
+			) {
+				romUnitCode = 0x02;
+			} else {
+				romUnitCode = 0;
+			}
+		} else {
+			isValid = (ndsHeader.arm9destination >= 0x02000000 && ndsHeader.arm9destination < 0x03000000 && ndsHeader.arm9executeAddress >= 0x02000000 && ndsHeader.arm9executeAddress < 0x03000000);
+			romVersion = ndsHeader.romversion;
+			romUnitCode = ndsHeader.unitCode;
+			a7mbk6 = ndsHeader.a7mbk6;
+		}
+
+		if (isNdz) {
+			isHomebrew = false;
+			isModernHomebrew = false;
+		} else {
+			fseek(fp, ndsHeader.arm9romOffset + ((strncmp(gameTid, "BIG", 3) == 0) ? 0x02000800 : ndsHeader.arm9executeAddress) - ndsHeader.arm9destination, SEEK_SET);
+			// "Battle/Combat of Giants: Mutant Insects" (TID: BIG) has code that is run before the actual SDK boot code
+			fread(arm9StartSig, sizeof(u32), 4, fp);
+			if ((arm9StartSig[0] == 0xE3A0C301 || (arm9StartSig[0] >= 0xEA000000 && arm9StartSig[0] < 0xEC000000 /* If title contains cracktro or extra splash */))
+			  && arm9StartSig[1] == 0xE58CC208) {
+				// Title seems to be developed with Nintendo SDK, verify
+				if ((arm9StartSig[2] >= 0xEB000000 && arm9StartSig[2] < 0xEC000000) // SDK 2 & TWL SDK 5
+				 && (arm9StartSig[3] >= 0xE3A00000 && arm9StartSig[3] < 0xE3A01000)) {
+					isHomebrew = false;
+					isModernHomebrew = false;
+				} else
+				if (arm9StartSig[2] == 0xE1DC00B6 // SDK 3-5
+				 && arm9StartSig[3] == 0xE3500000) {
+					isHomebrew = false;
+					isModernHomebrew = false;
+				} else
+				if (arm9StartSig[2] == 0xEAFFFFFF // SDK 4 (HM DS Cute)
+				 && arm9StartSig[3] == 0xE1DC00B6) {
+					isHomebrew = false;
+					isModernHomebrew = false;
+				}
+			} else if (strncmp(gameTid, "HNA", 3) == 0) {
+				// Modcrypted
 				isHomebrew = false;
 				isModernHomebrew = false;
 			}
-		} else if (strncmp(gameTid, "HNA", 3) == 0) {
-			// Modcrypted
-			isHomebrew = false;
-			isModernHomebrew = false;
 		}
 
 		if (isHomebrew) {
@@ -1195,8 +1251,9 @@ void getGameInfo(int fileOffset, bool isDir, const char* name, bool fromArgv)
 			 && arm9StartSig[3] == 0xE129F000) {
 				// isModernHomebrew = true; // Homebrew is recent (supports reading from SD without a DLDI driver)
 				if (ndsHeader.arm7executeAddress >= 0x037F0000 && ndsHeader.arm7destination >= 0x037F0000) {
-					if ((ndsHeader.arm9binarySize == 0xC9F68 && ndsHeader.arm7binarySize == 0x12814)	// Colors! v1.1
-					|| (ndsHeader.arm9binarySize == 0x1B0864 && ndsHeader.arm7binarySize == 0xDB50)	// Mario Paint Composer DS v2 (Bullet Bill)
+					if ((ndsHeader.arm7binarySize == 0x119A8)	// DS Game Maker homebrew
+					|| (ndsHeader.arm9binarySize == 0xC9F68 && ndsHeader.arm7binarySize == 0x12814)		// Colors! v1.1
+					|| (ndsHeader.arm9binarySize == 0x1B0864 && ndsHeader.arm7binarySize == 0xDB50)		// Mario Paint Composer DS v2 (Bullet Bill)
 					|| (ndsHeader.arm9binarySize == 0xE78FC && ndsHeader.arm7binarySize == 0xF068)		// SnowBros v2.2
 					|| (ndsHeader.arm9binarySize == 0xD45C0 && ndsHeader.arm7binarySize == 0x2B7C)		// ikuReader v0.058
 					|| (ndsHeader.arm9binarySize == 0x7A124 && ndsHeader.arm7binarySize == 0xEED0)		// PPSEDS r11
@@ -1211,18 +1268,15 @@ void getGameInfo(int fileOffset, bool isDir, const char* name, bool fromArgv)
 				isModernHomebrew = false; // Homebrew is old (requires a DLDI driver to read from SD)
 			}
 			if (!ms().secondaryDevice) {
-				if ((ndsHeader.arm9binarySize == 0x98F70 && ndsHeader.arm7binarySize == 0xED94)		// jEnesisDS 0.7.4
-				|| (ndsHeader.arm9binarySize == 0x48950 && ndsHeader.arm7binarySize == 0x74C4)			// SNEmulDS06-WIP2
-				|| (ndsHeader.arm9binarySize == 0xD45C0 && ndsHeader.arm7binarySize == 0x2B7C)			// ikuReader v0.058
-				|| (ndsHeader.arm9binarySize == 0x54620 && ndsHeader.arm7binarySize == 0x1538)) {		// XRoar 0.24fp3
+				if (ndsHeader.arm9binarySize == 0x54620 && ndsHeader.arm7binarySize == 0x1538) {		// XRoar 0.24fp3
 					requiresRamDisk = true;
 				}
 			}
-		} else if (ndsHeader.unitCode != 0 && (ndsHeader.accessControl & BIT(4))) {
+		} else if (!isNdz && ndsHeader.unitCode != 0 && (ndsHeader.accessControl & BIT(4))) {
 			isDSiWare = true; // Is a DSiWare game
 		}
 
-		if (!isHomebrew) {
+		if (!isNdz && !isHomebrew) {
 			// Check if ROM needs a donor ROM
 			bool dsiEnhancedMbk = (isDSiMode() && *(u32*)0x02FFE1A0 == 0x00403000 && sys().arm7SCFGLocked());
 			if (isDSiMode() && (a7mbk6 == (dsiEnhancedMbk ? 0x080037C0 : 0x00403000) || (ndsHeader.gameCode[0] == 'H' && ndsHeader.arm7binarySize < 0xC000 && ndsHeader.arm7idestination == 0x02E80000 && (REG_MBK9 & 0x00FFFFFF) != 0x00FFFF0F)) && sys().arm7SCFGLocked()) {
@@ -1241,10 +1295,12 @@ void getGameInfo(int fileOffset, bool isDir, const char* name, bool fromArgv)
 			}
 		}
 
-		if (ndsHeader.dsi_flags & BIT(4))
-			bnrWirelessIcon = 1;
-		else if (ndsHeader.dsi_flags & BIT(3))
-			bnrWirelessIcon = 2;
+		if (!isNdz) {
+			if (ndsHeader.dsi_flags & BIT(4))
+				bnrWirelessIcon = 1;
+			else if (ndsHeader.dsi_flags & BIT(3))
+				bnrWirelessIcon = 2;
+		}
 
 		if (ms().theme == TWLSettings::EThemeGBC && ms().filenameDisplay == 2) {
 			return;
@@ -1261,7 +1317,7 @@ void getGameInfo(int fileOffset, bool isDir, const char* name, bool fromArgv)
 				memcpy(paletteCopy, ndsBanner.palette, sizeof(paletteCopy));
 			}
 
-			if (customIcon != 2 && ndsHeader.bannerOffset == 0) {
+			if (customIcon != 2 && !isNdz && ndsHeader.bannerOffset == 0) {
 				fclose(fp);
 
 				// If no custom icon, display as unknown
@@ -1271,10 +1327,14 @@ void getGameInfo(int fileOffset, bool isDir, const char* name, bool fromArgv)
 				return;
 			}
 
-			fseek(fp, ndsHeader.bannerOffset, SEEK_SET);
+			const u32 bannerOffset = isNdz ? 0x10 : ndsHeader.bannerOffset;
+			fseek(fp, bannerOffset, SEEK_SET);
 			if (!fread(&ndsBanner, sizeof(ndsBanner), 1, fp)) {
+				// Only the NTR portion of the banner will be read, so clear the DSi
+				// animation data left behind by the previously loaded ROM.
+				toncset(ndsBanner.dsi_icon, 0, DSI_BANNER_ANIME_SIZE);
 				// try again, but using regular banner size
-				fseek(fp, ndsHeader.bannerOffset, SEEK_SET);
+				fseek(fp, bannerOffset, SEEK_SET);
 				if (!fread(&ndsBanner, NDS_BANNER_SIZE_ORIGINAL, 1, fp)) {
 					fclose(fp);
 
@@ -1324,7 +1384,9 @@ void getGameInfo(int fileOffset, bool isDir, const char* name, bool fromArgv)
 			return;
 		}
 
-		if (ndsHeader.dsi_flags & BIT(2)) {
+		if (!isNdz && (ndsHeader.dsi_flags & BIT(2))) {
+			std::string bnrPath;
+			std::string altBnrPath;
 			{
 				std::string filename = name;
 
@@ -1337,7 +1399,7 @@ void getGameInfo(int fileOffset, bool isDir, const char* name, bool fromArgv)
 
 				std::string typeToReplace = filename.substr(filename.rfind('.'));
 
-				std::string bnrPath = romFolderNoSlash + "/saves/" + filename;
+				bnrPath = romFolderNoSlash + "/saves/" + filename;
 				if (ms().saveLocation == TWLSettings::ETWLMFolder) {
 					std::string twlmSavesFolder = sys().isRunFromSD() ? "sd:/_nds/TWiLightMenu/saves" : "fat:/_nds/TWiLightMenu/saves";
 					bnrPath = twlmSavesFolder + "/" + filename;
@@ -1347,34 +1409,28 @@ void getGameInfo(int fileOffset, bool isDir, const char* name, bool fromArgv)
 				extern std::string getBnrExtension(void);
 				bnrPath = replaceAll(bnrPath, typeToReplace, getBnrExtension());
 
+				// A NAND/GM9i dump leaves the title's own banner save next to the ROM
+				// as a plain .bnr, which never carries a TWiLightMenu save slot suffix.
+				altBnrPath = replaceAll(romFolderNoSlash + "/" + filename, typeToReplace, ".bnr");
+
 				logPrint("Banner save path: %s\n", bnrPath.c_str());
-				fp = fopen(bnrPath.c_str(), "rb");
 			}
 
-			if (fp) {
-				logPrint("Banner save found!\n");
+			// The banner save is validated in full before anything is applied, so a
+			// blank or corrupt one leaves the ROM's own banner untouched.
+			if (dsiSubBannerLoad(bnrPath.c_str(), ndsBanner.dsi_icon, &ndsBanner.crc[3])
+			 || (altBnrPath != bnrPath && dsiSubBannerLoad(altBnrPath.c_str(), ndsBanner.dsi_icon, &ndsBanner.crc[3]))) {
+				logPrint("Banner save is valid.\n");
 
-				u16 ver = 0;
-				u16 crc16 = 0;
-				fread(&ver, sizeof(u16), 1, fp);
-				fseek(fp, 8, SEEK_SET);
-				fread(&crc16, sizeof(u16), 1, fp);
-				if (ver == NDS_BANNER_VER_DSi && crc16 != 0) {
-					logPrint("Banner save is valid.\n");
+				// A sub-banner only ever uses palette 0.
+				tonccpy(ndsBanner.icon, ndsBanner.dsi_icon, 512);
+				tonccpy(ndsBanner.palette, ndsBanner.dsi_palette, 16*sizeof(u16));
 
-					ndsBanner.crc[3] = crc16;
-
-					fseek(fp, 0x20, SEEK_SET);
-					fread(ndsBanner.dsi_icon, 1, 0x1180, fp);
-
-					tonccpy(ndsBanner.icon, ndsBanner.dsi_icon, 512);
-					tonccpy(ndsBanner.palette, ndsBanner.dsi_palette, 16*sizeof(u16));
-				} else {
-					logPrint("Banner save is invalid.\n");
-				}
-				fclose(fp);
+				// The banner now holds valid DSi animation data even when the ROM's
+				// own banner is NTR-only, so let the DSi code paths pick it up.
+				ndsBanner.version = NDS_BANNER_VER_DSi;
 			} else {
-				logPrint("Banner save not found!\n");
+				logPrint("No valid banner save.\n");
 			}
 		}
 

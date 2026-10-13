@@ -26,9 +26,6 @@ bool shouldClear[] = {false, false};
 void fontInit() {
 	logPrint("fontInit() ");
 
-	// const bool useExpansionPak = (sys().isRegularDS() && ((*(u16*)(0x020000C0) != 0 && *(u16*)(0x020000C0) != 0x5A45) || *(vu16*)(0x08240000) == 1) && (io_dldi_data->ioInterface.features & FEATURE_SLOT_NDS));
-	const bool useTileCache = (!dsiFeatures() && !sys().dsDebugRam());
-
 	// Unload fonts if already loaded
 	if (smallFont)
 		delete smallFont;
@@ -58,16 +55,19 @@ void fontInit() {
 		0xC000,
 	};
 
+	// const bool useExpansionPak = (sys().isRegularDS() && ((*(u16*)(0x020000C0) != 0 && *(u16*)(0x020000C0) != 0x5A45) || *(vu16*)(0x08240000) == 1) && (io_dldi_data->ioInterface.features & FEATURE_SLOT_NDS));
+	const bool useTileCache = (!dsiFeatures() && !sys().dsDebugRam());
+
 	// Load font graphics
 	if (ms().dsClassicCustomFont) {
 		std::string fontPath = std::string(sys().isRunFromSD() ? "sd:" : "fat:") + "/_nds/TWiLightMenu/extras/fonts/" + ms().font;
 		std::string defaultPath = std::string(sys().isRunFromSD() ? "sd:" : "fat:") + "/_nds/TWiLightMenu/extras/fonts/Default";
-		smallFont = new FontGraphic({fontPath + "/small-dsi.nftr", fontPath + "/small.nftr", defaultPath + "/small-dsi.nftr", "nitro:/graphics/font/ds.nftr"}, useTileCache);
+		smallFont = new FontGraphic({fontPath + "/small-dsi.nftr", fontPath + "/small.nftr", defaultPath + "/small-dsi.nftr", "nitro:/graphics/font/ds.nftr"}, false, true, useTileCache);
 	} else {
-		smallFont = new FontGraphic({"nitro:/graphics/font/ds.nftr"}, false);
+		smallFont = new FontGraphic({"nitro:/graphics/font/ds.nftr"}, false, false, false);
 		palette[3] = 0x94A5;
 	}
-	tinyFont = new FontGraphic({"nitro:/graphics/font/tiny.nftr"}, false);
+	tinyFont = new FontGraphic({"nitro:/graphics/font/tiny.nftr"}, false, false, false);
 	tinyFont->setFixedWidthChar('A'); // tiny font has tiny fixed-width
 
 	if (colorTable) {
@@ -82,7 +82,7 @@ void fontInit() {
 }
 
 void esrbDescFontInit(bool dsFont) {
-	esrbDescFont = new FontGraphic({dsFont ? "nitro:/graphics/font/ds.nftr" : "nitro:/graphics/font/small.nftr"}, false);
+	esrbDescFont = new FontGraphic({dsFont ? "nitro:/graphics/font/ds.nftr" : "nitro:/graphics/font/small.nftr"}, false, false, false);
 }
 
 void esrbDescFontDeinit() {
@@ -115,7 +115,26 @@ void updateText(bool top) {
 	text.clear();
 
 	// Copy buffer to the screen (top screen must be copied manually to background)
-	if (!top) tonccpy(bgGetGfxPtr(top ? 6 : 2), FontGraphic::textBuf[top], 256 * 192);
+	if (top) return;
+	tonccpy(bgGetGfxPtr(2) + (24 * (256)/2), FontGraphic::textBuf[0] + (24 * 256), 256 * (192-24)); // "B Back" text ignored
+}
+
+void updateBBackText() {
+	// Draw text
+	auto &text = getTextQueue(false);
+	for (auto it = text.begin(); it != text.end(); ++it) {
+		FontGraphic *font = getFont(it->large);
+		if (font)
+			font->print(it->x, it->y, false, it->message, it->align, it->palette, false, it->monospaced);
+	}
+	text.clear();
+
+	// Copy buffer to the back layer
+	for (int i = 0; i < 256*24; i++) {
+		if (FontGraphic::textBuf[0][i]) {
+			BG_GFX[i] = BG_PALETTE[FontGraphic::textBuf[0][i]] | BIT(15);
+		}
+	}
 }
 
 void updateTopTextArea(int x, int y, int width, int height, u16 *restoreBuf) {

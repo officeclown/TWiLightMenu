@@ -8,6 +8,7 @@
 #include <nds/arm9/dldi.h>
 #include <string.h>
 
+bool *unlaunchSettingsPtr;
 const char *charUnlaunchBg;
 int *removeLauncherPatchesPtr;
 
@@ -42,6 +43,7 @@ TWLSettings::TWLSettings()
 	macroMode = false;
 	// blfLevel = 0;
 	sleepMode = true;
+	lidSound = true;
 	kioskMode = false;
 	dsiWareExploit = EExploitNone;
 	wifiLed = true;
@@ -90,6 +92,7 @@ TWLSettings::TWLSettings()
 	dsiSplashAutoSkip = false;
 	nintendoLogoColor = 1;
 	showlogo = true;
+	splashEasterEggs = true;
 	longSplashJingle = false;
 	autorun = false;
 	autostartSlot1 = false;
@@ -101,6 +104,7 @@ TWLSettings::TWLSettings()
 	_3ds_theme = "light";
 
 	gbaBorder = "default.png";
+	unlaunchSettings = false;
 	unlaunchBg = "default.gif";
 	removeLauncherPatches = 2; // 2 == 'Default', keep splash/sound but allow the rest of the patches
 	font = "default";
@@ -108,6 +112,7 @@ TWLSettings::TWLSettings()
 	dsClassicCustomFont = false;
 
 	dontShowClusterWarning = false;
+	addonUpdateNoticeShown = 0;
 	ignoreBlacklists = false;
 
 	slot1AccessSD = false;
@@ -118,7 +123,7 @@ TWLSettings::TWLSettings()
 	dsiWareBooter = EDSiWareBootstrap;
 	dsiWareToSD = true;
 	newSnesEmuVer = false;
-	smsGgInRam = false;
+	dlplayRsaPatch = true;
 	esrbRatingScreen = false;
 
 	ak_viewMode = EViewInternal;
@@ -216,6 +221,7 @@ void TWLSettings::loadSettings()
 	titleLanguage = (TLanguage)settingsini.GetInt("SRLOADER", "TITLELANGUAGE", titleLanguage);
 	macroMode = settingsini.GetInt("SRLOADER", "MACRO_MODE", macroMode);
 	sleepMode = settingsini.GetInt("SRLOADER", "SLEEP_MODE", sleepMode);
+	lidSound = settingsini.GetInt("SRLOADER", "LID_SOUND", lidSound);
 	kioskMode = settingsini.GetInt("SRLOADER", "KIOSK_MODE", kioskMode);
 	dsiWareExploit = (TExploit)settingsini.GetInt("SRLOADER", "DSIWARE_EXPLOIT", dsiWareExploit);
 	wifiLed = settingsini.GetInt("SRLOADER", "WIFI_LED", wifiLed);
@@ -250,13 +256,9 @@ void TWLSettings::loadSettings()
 	sgEmulator = (TColSegaEmulator)settingsini.GetInt("SRLOADER", "SHOW_SG", sgEmulator);
 	if (sgEmulator == 0) // 0 (don't show) is deprecated
 		sgEmulator = EColSegaColecoDS;
-	if (!(isDSiMode() && (access("sd:/", F_OK) == 0) && sys().arm7SCFGLocked())) {
-		mdEmulator = (TMegaDriveEmulator)settingsini.GetInt("SRLOADER", "SHOW_MDGEN", mdEmulator);
-		if (mdEmulator == 0) // 0 (don't show) is deprecated
-			mdEmulator = EMegaDriveHybrid;
-	} else {
-		mdEmulator = EMegaDrivePico; // Use only PicoDriveTWL
-	}
+	mdEmulator = (TMegaDriveEmulator)settingsini.GetInt("SRLOADER", "SHOW_MDGEN", mdEmulator);
+	if (mdEmulator == 0) // 0 (don't show) is deprecated
+		mdEmulator = EMegaDriveHybrid;
 	//snesEmulator = settingsini.GetInt("SRLOADER", "SNES_EMULATOR", snesEmulator);
 	updateRecentlyPlayedList = settingsini.GetInt("SRLOADER", "UPDATE_RECENTLY_PLAYED_LIST", updateRecentlyPlayedList);
 	sortMethod = (TSortMethod)settingsini.GetInt("SRLOADER", "SORT_METHOD", sortMethod);
@@ -289,6 +291,7 @@ void TWLSettings::loadSettings()
 	dsiSplashAutoSkip = settingsini.GetInt("SRLOADER", "DSI_SPLASH_AUTO_SKIP", dsiSplashAutoSkip);
 	nintendoLogoColor = settingsini.GetInt("SRLOADER", "NINTENDO_LOGO_COLOR", nintendoLogoColor);
 	showlogo = settingsini.GetInt("SRLOADER", "SHOWLOGO", showlogo);
+	splashEasterEggs = settingsini.GetInt("SRLOADER", "SPLASH_EASTER_EGGS", splashEasterEggs);
 	longSplashJingle = settingsini.GetInt("SRLOADER", "LONG_SPLASH_JINGLE", longSplashJingle);
 	autorun = settingsini.GetInt("SRLOADER", "AUTORUNGAME", autorun);
 	autostartSlot1 = settingsini.GetInt("SRLOADER", "AUTORUNSLOT1", autostartSlot1);
@@ -300,6 +303,8 @@ void TWLSettings::loadSettings()
 	_3ds_theme = settingsini.GetString("SRLOADER", "3DS_THEME", _3ds_theme);
 
 	gbaBorder = settingsini.GetString("SRLOADER", "GBA_BORDER", gbaBorder);
+	unlaunchSettings = settingsini.GetInt("SRLOADER", "UNLAUNCH_SETTINGS", unlaunchSettings);
+	unlaunchSettingsPtr = &unlaunchSettings;
 	unlaunchBg = settingsini.GetString("SRLOADER", "UNLAUNCH_BG", unlaunchBg);
 	charUnlaunchBg = unlaunchBg.c_str();
 	removeLauncherPatches = settingsini.GetInt("SRLOADER", "UNLAUNCH_LAUNCHER_PATCHES", removeLauncherPatches);
@@ -309,6 +314,7 @@ void TWLSettings::loadSettings()
 	dsClassicCustomFont = settingsini.GetInt("SRLOADER", "DS_CLASSIC_CUSTOM_FONT", dsClassicCustomFont);
 
 	dontShowClusterWarning = settingsini.GetInt("SRLOADER", "DONT_SHOW_CLUSTER_WARNING", dontShowClusterWarning);
+	addonUpdateNoticeShown = settingsini.GetInt("SRLOADER", "ADDON_UPDATE_NOTICE_SHOWN", addonUpdateNoticeShown);
 	ignoreBlacklists = settingsini.GetInt("SRLOADER", "IGNORE_BLACKLISTS", ignoreBlacklists);
 
 	slot1AccessSD = settingsini.GetInt("SRLOADER", "SLOT1_ENABLESD", slot1AccessSD);
@@ -319,7 +325,7 @@ void TWLSettings::loadSettings()
 	dsiWareBooter = (TDSiWareBooter)settingsini.GetInt("SRLOADER", "DSIWARE_BOOTER", dsiWareBooter);
 	dsiWareToSD = settingsini.GetInt("SRLOADER", "DSIWARE_TO_SD", dsiWareToSD);
 	newSnesEmuVer = settingsini.GetInt("SRLOADER", "NEW_SNES_EMU_VER", newSnesEmuVer);
-	smsGgInRam = settingsini.GetInt("SRLOADER", "SMS_GG_IN_RAM", smsGgInRam);
+	dlplayRsaPatch = settingsini.GetInt("SRLOADER", "DLPLAY_RSA_PATCH", dlplayRsaPatch);
 	esrbRatingScreen = settingsini.GetInt("SRLOADER", "ESRB_RATING_SCREEN", esrbRatingScreen);
 
 	ak_viewMode = settingsini.GetInt("SRLOADER", "AK_VIEWMODE", ak_viewMode);
@@ -420,6 +426,7 @@ void TWLSettings::saveSettings()
 	settingsini.SetInt("SRLOADER", "TITLELANGUAGE", titleLanguage);
 	settingsini.SetInt("SRLOADER", "MACRO_MODE", macroMode);
 	settingsini.SetInt("SRLOADER", "SLEEP_MODE", sleepMode);
+	settingsini.SetInt("SRLOADER", "LID_SOUND", lidSound);
 	settingsini.SetInt("SRLOADER", "DSIWARE_EXPLOIT", dsiWareExploit);
 	settingsini.SetInt("SRLOADER", "WIFI_LED", wifiLed);
 	settingsini.SetInt("SRLOADER", "WIFI_LED_VER", wifiLedVer);
@@ -440,9 +447,7 @@ void TWLSettings::saveSettings()
 	}
 	settingsini.SetInt("SRLOADER", "SHOW_COL", colEmulator);
 	settingsini.SetInt("SRLOADER", "SHOW_SG", sgEmulator);
-	if (!(isDSiMode() && (access("sd:/", F_OK) == 0) && sys().arm7SCFGLocked())) {
-		settingsini.SetInt("SRLOADER", "SHOW_MDGEN", mdEmulator);
-	}
+	settingsini.SetInt("SRLOADER", "SHOW_MDGEN", mdEmulator);
 	// settingsini.SetInt("SRLOADER", "SNES_EMULATOR", snesEmulator);
 	settingsini.SetInt("SRLOADER", "UPDATE_RECENTLY_PLAYED_LIST", updateRecentlyPlayedList);
 	settingsini.SetInt("SRLOADER", "SORT_METHOD", sortMethod);
@@ -473,6 +478,7 @@ void TWLSettings::saveSettings()
 	settingsini.SetInt("SRLOADER", "DSI_SPLASH_AUTO_SKIP", dsiSplashAutoSkip);
 	settingsini.SetInt("SRLOADER", "NINTENDO_LOGO_COLOR", nintendoLogoColor);
 	settingsini.SetInt("SRLOADER", "SHOWLOGO", showlogo);
+	settingsini.SetInt("SRLOADER", "SPLASH_EASTER_EGGS", splashEasterEggs);
 	settingsini.SetInt("SRLOADER", "LONG_SPLASH_JINGLE", longSplashJingle);
 	settingsini.SetInt("SRLOADER", "AUTORUNGAME", autorun);
 	settingsini.SetInt("SRLOADER", "AUTORUNSLOT1", autostartSlot1);
@@ -491,6 +497,7 @@ void TWLSettings::saveSettings()
 	settingsini.SetInt("SRLOADER", "DS_CLASSIC_CUSTOM_FONT", dsClassicCustomFont);
 
 	settingsini.SetInt("SRLOADER", "DONT_SHOW_CLUSTER_WARNING", dontShowClusterWarning);
+	settingsini.SetInt("SRLOADER", "ADDON_UPDATE_NOTICE_SHOWN", addonUpdateNoticeShown);
 	settingsini.SetInt("SRLOADER", "IGNORE_BLACKLISTS", ignoreBlacklists);
 
 	settingsini.SetInt("SRLOADER", "SLOT1_ENABLESD", slot1AccessSD);
@@ -499,7 +506,7 @@ void TWLSettings::saveSettings()
 	settingsini.SetInt("SRLOADER", "DONT_SHOW_DSIWARE_IN_DS_MODE_WARNING", dontShowDSiWareInDSModeWarning);
 	settingsini.SetInt("SRLOADER", "DSIWARE_BOOTER", dsiWareBooter);
 	settingsini.SetInt("SRLOADER", "DSIWARE_TO_SD", dsiWareToSD);
-	settingsini.SetInt("SRLOADER", "SMS_GG_IN_RAM", smsGgInRam);
+	settingsini.SetInt("SRLOADER", "DLPLAY_RSA_PATCH", dlplayRsaPatch);
 	settingsini.SetInt("SRLOADER", "ESRB_RATING_SCREEN", esrbRatingScreen);
 
 	settingsini.SetInt("SRLOADER", "AK_VIEWMODE", ak_viewMode);
